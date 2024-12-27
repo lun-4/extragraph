@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bluesky-social/indigo/api/atproto"
@@ -41,7 +42,7 @@ func (ff *ScriptableFollowingFeed) Describe(ctx context.Context) ([]appbsky.Feed
 	feeds := make([]appbsky.FeedDescribeFeedGenerator_Feed, 0)
 	for i := range 5 {
 		feeds = append(feeds, appbsky.FeedDescribeFeedGenerator_Feed{
-			Uri: fmt.Sprintf("at://"+ff.FeedActorDID+"/app.bsky.feed.generator/%s%d", ff.FeedName, i+1),
+			Uri: fmt.Sprintf("at://"+ff.FeedActorDID+"/app.bsky.feed.generator/%s_%d", ff.FeedName, i+1),
 		})
 	}
 	return feeds, nil
@@ -76,8 +77,19 @@ func (ff *ScriptableFollowingFeed) getFollowing(userDID string) ([]string, error
 func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, userDID string, limit int64, cursor string) ([]*appbsky.FeedDefs_SkeletonFeedPost, *string, error) {
 	slog.Info("following feed page", slog.String("feed", feed), slog.String("user", userDID), slog.Int64("limit", limit), slog.String("cursor", cursor))
 
-	if feed != "slot1" {
-		return nil, nil, fmt.Errorf("invalid feed: %s", feed)
+	splitted := strings.Split(feed, "_")
+	feedName := splitted[0]
+	if feedName != ff.FeedName {
+		return nil, nil, fmt.Errorf("unknown feed name: %s", feed)
+	}
+
+	slot, err := strconv.ParseInt(splitted[1], 10, 32)
+	if err != nil {
+
+		return nil, nil, fmt.Errorf("invalid slot number: %s", splitted[1])
+	}
+	if slot < 1 && slot > 5 {
+		return nil, nil, fmt.Errorf("unknown slot number: %d", slot)
 	}
 
 	var cursorAsIndex uint64
