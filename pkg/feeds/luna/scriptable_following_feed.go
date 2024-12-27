@@ -41,7 +41,7 @@ func (ff *ScriptableFollowingFeed) Describe(ctx context.Context) ([]appbsky.Feed
 	feeds := make([]appbsky.FeedDescribeFeedGenerator_Feed, 0)
 	for i := range 5 {
 		feeds = append(feeds, appbsky.FeedDescribeFeedGenerator_Feed{
-			Uri: fmt.Sprintf("at://"+ff.FeedActorDID+"/app.bsky.feed.generator/scriptable_slot%d", i+1),
+			Uri: fmt.Sprintf("at://"+ff.FeedActorDID+"/app.bsky.feed.generator/%s%d", ff.FeedName, i+1),
 		})
 	}
 	return feeds, nil
