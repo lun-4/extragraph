@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -75,8 +76,13 @@ func NewAuth(
 		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 
+	plcUrl := os.Getenv("ATPROTO_PLC_URL")
+	if plcUrl == "" {
+		plcUrl = "https://plc.directory"
+	}
+
 	baseDir := identity.BaseDirectory{
-		PLCURL:              "https://plc.gsky.ln4.net", // NOTE(luna): need customizable plc url
+		PLCURL:              plcUrl,
 		PLCLimiter:          rate.NewLimiter(rate.Limit(float64(requestsPerSecond)), 1),
 		HTTPClient:          client,
 		TryAuthoritativeDNS: true,
