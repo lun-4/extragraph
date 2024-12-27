@@ -115,7 +115,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 
 	query += fmt.Sprintf(" LIMIT %d", limit)
 
-	rows, err := ff.db.Query(query, cursorAsIndex, userDID, 1)
+	rows, err := ff.db.Query(query, cursorAsIndex, userDID, slot)
 	if err != nil {
 		slog.Error("error getting posts", slog.String("user", userDID), slog.Any("err", err))
 		return nil, nil, err
