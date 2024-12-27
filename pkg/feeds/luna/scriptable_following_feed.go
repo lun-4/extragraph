@@ -48,8 +48,12 @@ func (ff *ScriptableFollowingFeed) Describe(ctx context.Context) ([]appbsky.Feed
 	return feeds, nil
 }
 
-func (ff *ScriptableFollowingFeed) GetFeedName() string {
-	return ff.FeedName
+func (ff *ScriptableFollowingFeed) GetFeedNames() []string {
+	feeds := make([]string, 0)
+	for i := range 5 {
+		feeds = append(feeds, fmt.Sprintf("%s_%d", ff.FeedName, i+1))
+	}
+	return feeds
 }
 
 func (ff *ScriptableFollowingFeed) getFollowing(userDID string) ([]string, error) {
@@ -80,12 +84,11 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 	splitted := strings.Split(feed, "_")
 	feedName := splitted[0]
 	if feedName != ff.FeedName {
-		return nil, nil, fmt.Errorf("unknown feed name: %s", feed)
+		return nil, nil, fmt.Errorf("unknown feed name: want %s, got %s", ff.FeedName, feed)
 	}
 
 	slot, err := strconv.ParseInt(splitted[1], 10, 32)
 	if err != nil {
-
 		return nil, nil, fmt.Errorf("invalid slot number: %s", splitted[1])
 	}
 	if slot < 1 && slot > 5 {
@@ -103,7 +106,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 	}
 
 	query := `
-		SELECT at_path, counter
+		SELECT posts.at_path, posts.counter
 		FROM allowed_posts
 		JOIN posts
 			ON allowed_posts.at_path = posts.at_path

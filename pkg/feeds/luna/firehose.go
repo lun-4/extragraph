@@ -31,7 +31,7 @@ import (
 type DynamicFeed interface {
 	feedrouter.Feed
 	Spawn(context.Context)
-	GetFeedName() string
+	GetFeedNames() []string
 }
 
 func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
@@ -86,8 +86,8 @@ func (ff *FollowingFeed) Describe(ctx context.Context) ([]appbsky.FeedDescribeFe
 	}, nil
 }
 
-func (ff *FollowingFeed) GetFeedName() string {
-	return ff.FeedName
+func (ff *FollowingFeed) GetFeedNames() []string {
+	return []string{ff.FeedName}
 }
 
 func (ff *FollowingFeed) getFollowing(userDID string) ([]string, error) {

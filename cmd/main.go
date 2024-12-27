@@ -95,7 +95,7 @@ func main() {
 	lunaFeeds, _ := lunafeeds.ConfigureLunaFeeds(ctx)
 	for _, lunaFeed := range lunaFeeds {
 		lunaFeed.Spawn(ctx)
-		feedRouter.AddFeed([]string{lunaFeed.GetFeedName()}, lunaFeed)
+		feedRouter.AddFeed(lunaFeed.GetFeedNames(), lunaFeed)
 	}
 
 	// Create a gin router with default middleware for logging and recovery
