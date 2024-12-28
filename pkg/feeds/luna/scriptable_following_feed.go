@@ -29,8 +29,11 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/arnodel/golua/lib/base"
+	"github.com/arnodel/golua/lib/mathlib"
 	"github.com/arnodel/golua/lib/packagelib"
 	"github.com/arnodel/golua/lib/stringlib"
+	"github.com/arnodel/golua/lib/tablelib"
+	"github.com/arnodel/golua/lib/utf8lib"
 	rt "github.com/arnodel/golua/runtime"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -61,6 +64,9 @@ func Compile(script Script) (ScriptRuntime, error) {
 	base.Load(sr.rt)
 	sr.cleanups = append(sr.cleanups, packagelib.LibLoader.Run(sr.rt))
 	sr.cleanups = append(sr.cleanups, stringlib.LibLoader.Run(sr.rt))
+	sr.cleanups = append(sr.cleanups, mathlib.LibLoader.Run(sr.rt))
+	sr.cleanups = append(sr.cleanups, tablelib.LibLoader.Run(sr.rt))
+	sr.cleanups = append(sr.cleanups, utf8lib.LibLoader.Run(sr.rt))
 	chunk, err := sr.rt.CompileAndLoadLuaChunk("test", []byte(script.Text), rt.TableValue(sr.rt.GlobalEnv()))
 	if err != nil {
 		return ScriptRuntime{}, err
