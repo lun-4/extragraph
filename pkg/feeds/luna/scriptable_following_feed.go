@@ -506,6 +506,8 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 
 func recToTable(anyV any) rt.Value {
 	switch v := anyV.(type) {
+	case nil:
+		return rt.NilValue
 	case int64:
 		return rt.IntValue(v)
 	case string:
