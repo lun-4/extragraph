@@ -25,6 +25,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/samber/lo"
 
+	"github.com/arnodel/golua/lib/base"
 	rt "github.com/arnodel/golua/runtime"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -476,12 +477,19 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 		}
 
 		r := rt.New(os.Stdout)
+		base.Load(r)
 		chunk, err := r.CompileAndLoadLuaChunk("test", []byte(script.Text), rt.TableValue(r.GlobalEnv()))
 		if err != nil {
 			slog.Error("error compiling lua chunk", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
-		filterFunction, _ := rt.Call1(r.MainThread(), rt.FunctionValue(chunk))
+		scriptSpec, err := rt.Call1(r.MainThread(), rt.FunctionValue(chunk))
+		if err != nil {
+			slog.Error("error calling ", slog.Any("err", err), slog.String("from_did", fromDid))
+			continue
+		}
+
+		filterFunction := scriptSpec.AsTable().Get(rt.StringValue("filter"))
 
 		// NOTE: this gives the overall post context to the script
 		// TODO: add post, follow list, etc, to script context
@@ -496,7 +504,7 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 		isAllowed := allowed.AsBool()
 		if isAllowed {
 			hadAnyAllowed = true
-			_, err = ff.db.Exec(`INSERT INTO allowed_posts (from_did, at_path) VALUES ($1, $2) ON CONFLICT DO NOTHING`, fromDid, atPath)
+			_, err = ff.db.Exec(`INSERT INTO allowed_posts (from_did, slot, at_path) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, fromDid, script.Slot, atPath)
 			if err != nil {
 				slog.Error("error inserting allowed post", slog.Any("err", err))
 			} else {
