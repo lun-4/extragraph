@@ -500,11 +500,11 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 						}
 					}
 				case "app.bsky.feed.post":
-					ff.reportChannel <- INCOMING_POST
 					rec, err := data.UnmarshalCBOR(recordData)
 					if err != nil {
 						continue
 					}
+					ff.reportChannel <- INCOMING_POST
 
 					atPath := fmt.Sprintf("at://%s/%s", userDid, op.Path)
 					ok, err := ff.handlePost(rec, atPath)
