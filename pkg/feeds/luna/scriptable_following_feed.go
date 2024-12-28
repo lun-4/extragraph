@@ -508,6 +508,8 @@ func recToTable(anyV any) rt.Value {
 	switch v := anyV.(type) {
 	case nil:
 		return rt.NilValue
+	case bool:
+		return rt.BoolValue(v)
 	case int64:
 		return rt.IntValue(v)
 	case string:
