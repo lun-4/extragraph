@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +39,39 @@ type ScriptableFollowingFeed struct {
 	db           *sql.DB
 	relayAddress string
 	appviewUrl   string
+	runtimes     map[uint64]ScriptRuntime
+}
+
+type ScriptRuntime struct {
+	hash       uint64
+	rt         *rt.Runtime
+	chunk      *rt.Closure
+	scriptSpec rt.Value
+	filterFunc rt.Value
+}
+
+func Compile(script Script) (ScriptRuntime, error) {
+	sr := ScriptRuntime{hash: script.Hash()}
+	sr.rt = rt.New(os.Stdout)
+	base.Load(sr.rt)
+	chunk, err := sr.rt.CompileAndLoadLuaChunk("test", []byte(script.Text), rt.TableValue(sr.rt.GlobalEnv()))
+	if err != nil {
+		return ScriptRuntime{}, err
+	}
+	sr.chunk = chunk
+	scriptSpec, err := rt.Call1(sr.rt.MainThread(), rt.FunctionValue(chunk))
+	if err != nil {
+		return ScriptRuntime{}, err
+	}
+	sr.scriptSpec = scriptSpec
+	sr.filterFunc = scriptSpec.AsTable().Get(rt.StringValue("filter"))
+	return sr, nil
+}
+
+func (sr *ScriptRuntime) Cleanup() {
+	sr.rt = nil
+	sr.chunk = nil
+
 }
 
 func (ff *ScriptableFollowingFeed) Describe(ctx context.Context) ([]appbsky.FeedDescribeFeedGenerator_Feed, error) {
@@ -318,6 +353,12 @@ type Script struct {
 	Text string
 }
 
+func (s Script) Hash() uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(s.Text))
+	return h.Sum64()
+}
+
 func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 	var syncCursorDb *int64
 	err := ff.db.QueryRow(`SELECT max(cursor) FROM firehose_sync_position`).Scan(&syncCursorDb)
@@ -459,6 +500,7 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 		slog.Error("error querying scrape state", slog.Any("err", err))
 		return false, err
 	}
+	usedRuntimes := make([]uint64, 0)
 	var hadAnyAllowed bool
 	for rows.Next() {
 		var fromDid string
@@ -469,47 +511,67 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 		}
 		fmt.Println(fromDid)
 
-		var script Script
-		err = ff.db.QueryRow(`SELECT slot, script FROM scripts WHERE from_did = $1`, fromDid).Scan(&script.Slot, &script.Text)
+		rows, err := ff.db.Query(`SELECT slot, script FROM scripts WHERE from_did = $1`, fromDid)
 		if err != nil {
-			slog.Error("error querying script from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			slog.Error("error querying script rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
-
-		r := rt.New(os.Stdout)
-		base.Load(r)
-		chunk, err := r.CompileAndLoadLuaChunk("test", []byte(script.Text), rt.TableValue(r.GlobalEnv()))
-		if err != nil {
-			slog.Error("error compiling lua chunk", slog.Any("err", err), slog.String("from_did", fromDid))
-			continue
-		}
-		scriptSpec, err := rt.Call1(r.MainThread(), rt.FunctionValue(chunk))
-		if err != nil {
-			slog.Error("error calling ", slog.Any("err", err), slog.String("from_did", fromDid))
-			continue
-		}
-
-		filterFunction := scriptSpec.AsTable().Get(rt.StringValue("filter"))
-
-		// NOTE: this gives the overall post context to the script
-		// TODO: add post, follow list, etc, to script context
-		_ = record
-		t := rt.NewTable()
-		t.Set(rt.StringValue("a"), rt.IntValue(1))
-		allowed, err := rt.Call1(r.MainThread(), filterFunction, rt.TableValue(t))
-		if err != nil {
-			slog.Error("error calling allowed", slog.Any("err", err), slog.String("from_did", fromDid))
-			continue
-		}
-		isAllowed := allowed.AsBool()
-		if isAllowed {
-			hadAnyAllowed = true
-			_, err = ff.db.Exec(`INSERT INTO allowed_posts (from_did, slot, at_path) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, fromDid, script.Slot, atPath)
+		for rows.Next() {
+			var script Script
+			err = rows.Scan(&script.Slot, &script.Text)
 			if err != nil {
-				slog.Error("error inserting allowed post", slog.Any("err", err))
-			} else {
-				slog.Debug("allowed post created", slog.String("at", atPath), slog.String("from", fromDid))
+				slog.Error("error querying script row from did", slog.Any("err", err), slog.String("from_did", fromDid))
+				continue
 			}
+
+			runtime, found := ff.runtimes[script.Hash()]
+			if !found {
+				newRuntime, err := Compile(script)
+				if err != nil {
+					slog.Error("error compiling script", slog.Any("err", err), slog.String("from_did", fromDid), slog.Int64("slot", script.Slot))
+					continue
+				}
+				ff.runtimes[script.Hash()] = newRuntime
+				runtime = newRuntime
+			}
+			usedRuntimes = append(usedRuntimes, runtime.hash)
+
+			// NOTE: this gives the overall post context to the script
+			// TODO: add post, follow list, etc, to script context
+			_ = record
+			t := rt.NewTable()
+			t.Set(rt.StringValue("a"), rt.IntValue(1))
+			runtime.rt.PushContext(rt.RuntimeContextDef{
+				HardLimits: rt.RuntimeResources{
+					Memory: 100000,
+					Cpu:    1000000,
+					Millis: 300,
+				},
+				RequiredFlags: rt.ComplyIoSafe | rt.ComplyCpuSafe | rt.ComplyMemSafe | rt.ComplyTimeSafe,
+			})
+			allowed, err := rt.Call1(runtime.rt.MainThread(), runtime.filterFunc, rt.TableValue(t))
+			_ = runtime.rt.PopContext()
+			if err != nil {
+				slog.Error("error calling script", slog.Any("err", err), slog.String("from_did", fromDid))
+				continue
+			}
+			isAllowed := allowed.AsBool()
+			if isAllowed {
+				hadAnyAllowed = true
+				_, err = ff.db.Exec(`INSERT INTO allowed_posts (from_did, slot, at_path) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, fromDid, script.Slot, atPath)
+				if err != nil {
+					slog.Error("error inserting allowed post", slog.Any("err", err))
+				} else {
+					slog.Debug("allowed post created", slog.String("at", atPath), slog.String("from", fromDid))
+				}
+			}
+		}
+	}
+
+	for k, runtime := range ff.runtimes {
+		if !slices.Contains(usedRuntimes, k) {
+			slog.Warn("runtime not used", slog.Uint64("hash", k))
+			runtime.Cleanup()
 		}
 	}
 

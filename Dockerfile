@@ -14,6 +14,7 @@ RUN make build
 
 FROM debian:bookworm
 COPY --from=0 /src/feedgen /feedgen
+COPY --from=0 /src/feedgen-admin /feedgen-admin
 RUN apt update
 RUN apt install -y ca-certificates
 RUN update-ca-certificates -f

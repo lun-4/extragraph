@@ -59,6 +59,7 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 			FeedName:     os.Getenv("SCRIPTABLE_FOLLOWING_FEED_NAME"),
 			relayAddress: relayAddress,
 			appviewUrl:   os.Getenv("APPVIEW_URL"),
+			runtimes:     make(map[uint64]ScriptRuntime),
 		})
 	} else {
 		slog.Warn("scriptable following feed is disabled, skipping")

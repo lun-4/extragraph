@@ -1,6 +1,8 @@
 return {
-  filter = function(post) do
+  filter = function(post)
+    print("shit")
+    print("ASlkdjsalkdjf2")
     print(post)
-    return true
-  end
+    return false
+  end,
 }
