@@ -69,9 +69,9 @@ func Compile(script Script) (ScriptRuntime, error) {
 }
 
 func (sr *ScriptRuntime) Cleanup() {
+	sr.rt.MainThread().CollectGarbage()
 	sr.rt = nil
 	sr.chunk = nil
-
 }
 
 func (ff *ScriptableFollowingFeed) Describe(ctx context.Context) ([]appbsky.FeedDescribeFeedGenerator_Feed, error) {
@@ -571,6 +571,7 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 	for k, runtime := range ff.runtimes {
 		if !slices.Contains(usedRuntimes, k) {
 			slog.Warn("runtime not used", slog.Uint64("hash", k))
+			delete(ff.runtimes, runtime.hash)
 			runtime.Cleanup()
 		}
 	}
