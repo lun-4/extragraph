@@ -29,6 +29,8 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/arnodel/golua/lib/base"
+	"github.com/arnodel/golua/lib/packagelib"
+	"github.com/arnodel/golua/lib/stringlib"
 	rt "github.com/arnodel/golua/runtime"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -49,12 +51,15 @@ type ScriptRuntime struct {
 	chunk      *rt.Closure
 	scriptSpec rt.Value
 	filterFunc rt.Value
+	cleanups   []func()
 }
 
 func Compile(script Script) (ScriptRuntime, error) {
-	sr := ScriptRuntime{hash: script.Hash()}
+	sr := ScriptRuntime{hash: script.Hash(), cleanups: make([]func(), 0)}
 	sr.rt = rt.New(os.Stdout)
 	base.Load(sr.rt)
+	sr.cleanups = append(sr.cleanups, packagelib.LibLoader.Run(sr.rt))
+	sr.cleanups = append(sr.cleanups, stringlib.LibLoader.Run(sr.rt))
 	chunk, err := sr.rt.CompileAndLoadLuaChunk("test", []byte(script.Text), rt.TableValue(sr.rt.GlobalEnv()))
 	if err != nil {
 		return ScriptRuntime{}, err
@@ -70,6 +75,11 @@ func Compile(script Script) (ScriptRuntime, error) {
 }
 
 func (sr *ScriptRuntime) Cleanup() {
+	for _, cleanup := range sr.cleanups {
+		if cleanup != nil {
+			cleanup()
+		}
+	}
 	sr.rt.MainThread().CollectGarbage()
 	sr.rt = nil
 	sr.chunk = nil
