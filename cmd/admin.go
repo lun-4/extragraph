@@ -31,7 +31,12 @@ func wantArgInt(i int) int64 {
 }
 
 func main() {
-	arg1 := os.Args[1]
+	var arg1 string
+	if len(os.Args) < 2 {
+		arg1 = "help"
+	} else {
+		arg1 = os.Args[1]
+	}
 
 	// TODO a better config thing
 	databasePath := os.Getenv("SCRIPTABLE_FOLLOWING_FEED_DATABASE_PATH")
@@ -46,6 +51,13 @@ func main() {
 	defer db.Close()
 
 	switch arg1 {
+	case "help":
+		fmt.Println("usage: %s <command>", os.Args[0])
+		fmt.Println(`
+		ls: list scrape state
+		adduser <did>: add user to scrape
+		setscript <did> <slot> <path>: set script for given slot
+		`)
 	case "ls":
 		rows, err := db.Query(`SELECT from_did, state FROM scrape_state`)
 		if err != nil {
@@ -82,5 +94,7 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+	default:
+		log.Fatalln("unknown command:", arg1)
 	}
 }
