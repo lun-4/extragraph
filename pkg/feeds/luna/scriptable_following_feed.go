@@ -42,6 +42,7 @@ import (
 type ScriptableFollowingFeed struct {
 	FeedActorDID  string
 	FeedName      string
+	DatabasePath  string
 	db            *sql.DB
 	relayAddress  string
 	appviewUrl    string
@@ -201,21 +202,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 }
 
 func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
-	f, err := os.OpenFile("scriptable_following_feed.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		slog.Error("error opening log file", slog.Any("err", err))
-		panic("failed to open log file")
-	}
-	defer f.Close()
-
-	wrt := io.MultiWriter(os.Stderr, f)
-
-	log.SetOutput(wrt)
-	if os.Getenv("DEBUG") == "1" {
-		slog.SetLogLoggerLevel(slog.LevelDebug)
-	}
-
-	db, err := sql.Open("sqlite3", "scriptable_follower_feed_state.db")
+	db, err := sql.Open("sqlite3", ff.DatabasePath)
 	if err != nil {
 		log.Fatal(err)
 	}

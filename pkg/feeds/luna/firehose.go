@@ -54,9 +54,14 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 		slog.Warn("Following feed is disabled")
 	}
 	if os.Getenv("SCRIPTABLE_FOLLOWING_FEED_ENABLE") == "1" {
+		databasePath := os.Getenv("SCRIPTABLE_FOLLOWING_FEED_DATABASE_PATH")
+		if databasePath == "" {
+			databasePath = "scriptable_follower_feed_state.db"
+		}
 		feeds = append(feeds, &ScriptableFollowingFeed{
 			FeedActorDID:  os.Getenv("SCRIPTABLE_FOLLOWING_FEED_ACTOR_DID"),
 			FeedName:      os.Getenv("SCRIPTABLE_FOLLOWING_FEED_NAME"),
+			DatabasePath:  databasePath,
 			relayAddress:  relayAddress,
 			appviewUrl:    os.Getenv("APPVIEW_URL"),
 			runtimes:      make(map[uint64]ScriptRuntime),

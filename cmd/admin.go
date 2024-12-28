@@ -33,13 +33,17 @@ func wantArgInt(i int) int64 {
 func main() {
 	arg1 := os.Args[1]
 
-	db, err := sql.Open("sqlite3", "scriptable_follower_feed_state.db")
+	// TODO a better config thing
+	databasePath := os.Getenv("SCRIPTABLE_FOLLOWING_FEED_DATABASE_PATH")
+	if databasePath == "" {
+		databasePath = "scriptable_follower_feed_state.db"
+	}
+
+	db, err := sql.Open("sqlite3", databasePath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
-	db.Exec(`INSERT INTO`)
 
 	switch arg1 {
 	case "ls":

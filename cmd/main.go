@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,6 +30,24 @@ import (
 
 func main() {
 	ctx := context.Background()
+	logPath := os.Getenv("LOGFILE")
+	if logPath == "" {
+		logPath = "./feedgen.log"
+	}
+
+	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening log file %s: %w", err.Error())
+		panic("failed to open log file")
+	}
+	defer f.Close()
+
+	wrt := io.MultiWriter(os.Stderr, f)
+
+	log.SetOutput(wrt)
+	if os.Getenv("DEBUG") == "1" {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
 
 	// Configure feed generator from environment variables
 
