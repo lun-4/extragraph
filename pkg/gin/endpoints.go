@@ -150,6 +150,9 @@ func (ep *Endpoints) GetFeedSkeleton(c *gin.Context) {
 		return
 	}
 
+	for k, v := range ep.FeedRouter.FeedMap {
+		fmt.Println(k, v)
+	}
 	feed, ok := ep.FeedRouter.FeedMap[feedName]
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "feed not found"})

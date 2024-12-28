@@ -221,6 +221,7 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 	}
 	ff.db = db
 	go ff.main(ctx)
+	go ff.scrapeFollowers(ctx)
 }
 
 func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
@@ -231,6 +232,83 @@ func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
 		}
 		slog.Info("firehose consumer stopped, restarting in 3 seconds")
 		time.Sleep(3 * time.Second)
+	}
+}
+
+func (ff *ScriptableFollowingFeed) scrapeNewAccounts(ctx context.Context) error {
+	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'pending'")
+	if err != nil {
+		return fmt.Errorf("error querying scrape state: %w", err)
+	}
+	for rows.Next() {
+		var fromDid string
+		err := rows.Scan(&fromDid)
+		if err != nil {
+			slog.Error("error scanning scrape state did", slog.Any("err", err))
+			continue
+		}
+		slog.Info("scraping new did", slog.String("did", fromDid))
+		var cursor string
+		for {
+			var url string
+			if cursor != "" {
+				url = fmt.Sprintf("%s/xrpc/app.bsky.graph.getFollows?actor=%s&cursor=%s", ff.appviewUrl, fromDid, cursor)
+			} else {
+				url = fmt.Sprintf("%s/xrpc/app.bsky.graph.getFollows?actor=%s", ff.appviewUrl, fromDid)
+			}
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				return fmt.Errorf("error creating request: %w", err)
+			}
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("error sending request: %w", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				return fmt.Errorf("error sending request: status %d", res.StatusCode)
+			}
+			resBody, err := io.ReadAll(res.Body)
+			if err != nil {
+				return fmt.Errorf("error reading response body: %w", err)
+			}
+			var data map[string]any
+			err = json.Unmarshal(resBody, &data)
+			if err != nil {
+				return fmt.Errorf("error unmarshaling response: %w", err)
+			}
+
+			for _, followAny := range data["follows"].([]any) {
+				follow := followAny.(map[string]any)
+				subject := follow["did"].(string)
+				_, err := ff.db.Exec(`INSERT INTO follow_relationships (from_did, to_did) VALUES ($1, $2) ON CONFLICT DO NOTHING`, fromDid, subject)
+				if err != nil {
+					slog.Error("error inserting follow", slog.Any("err", err), slog.String("from", fromDid), slog.String("to", subject))
+				} else {
+					slog.Info("followed", slog.String("from", fromDid), slog.String("to", subject))
+				}
+			}
+			if data["cursor"] == nil {
+				break
+			} else {
+				cursor = data["cursor"].(string)
+			}
+		}
+		_, err = ff.db.Exec("UPDATE scrape_state SET state = 'ready' WHERE from_did = ?", fromDid)
+		if err != nil {
+			return fmt.Errorf("error updating scrape state: %w", err)
+		}
+		slog.Info("scraped new followers", slog.String("from", fromDid))
+	}
+	return nil
+}
+func (ff *ScriptableFollowingFeed) scrapeFollowers(ctx context.Context) {
+	for {
+		err := ff.scrapeNewAccounts(ctx)
+		if err != nil {
+			slog.Error("error in follower scraper", slog.Any("err", err))
+		}
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -388,9 +466,10 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 			slog.Error("error scanning scrape state did", slog.Any("err", err))
 			continue
 		}
+		fmt.Println(fromDid)
 
 		var script Script
-		err = ff.db.QueryRow(`SELECT slot, text FROM scripts WHERE from_did = $1`, fromDid).Scan(&script.Slot, &script.Text)
+		err = ff.db.QueryRow(`SELECT slot, script FROM scripts WHERE from_did = $1`, fromDid).Scan(&script.Slot, &script.Text)
 		if err != nil {
 			slog.Error("error querying script from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue

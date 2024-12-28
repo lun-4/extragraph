@@ -13,6 +13,7 @@
 
 # Feed Generator Binary
 feedgen
+feedgen-admin
 
 # Test binary, built with `go test -c`
 *.test
