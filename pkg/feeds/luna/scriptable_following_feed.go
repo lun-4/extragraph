@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -493,6 +494,48 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 	return events.HandleRepoStream(context.Background(), con, sched)
 }
 
+func recToTable(anyV any) rt.Value {
+	switch v := anyV.(type) {
+	case int64:
+		return rt.IntValue(v)
+	case string:
+		return rt.StringValue(v)
+	case []any:
+		res := make([]rt.Value, 0)
+		for _, inner := range v {
+			res = append(res, recToTable(inner))
+		}
+		return rt.ArrayValue(res)
+	case map[any]any:
+		out := rt.NewTable()
+		for anyK, anyV := range v {
+			k := recToTable(anyK)
+			v := recToTable(anyV)
+			out.Set(k, v)
+		}
+		return rt.TableValue(out)
+	case map[string]any:
+		out := rt.NewTable()
+		for anyK, anyV := range v {
+			k := recToTable(anyK)
+			v := recToTable(anyV)
+			out.Set(k, v)
+		}
+		return rt.TableValue(out)
+	case data.Blob:
+		return recToTable(map[string]any{
+			"mimeType": v.MimeType,
+			"size":     v.Size,
+			"ref":      v.Ref,
+		})
+	case data.CIDLink:
+		return recToTable(v.String())
+	default:
+		slog.Warn("unknown value", slog.Any("v", anyV), slog.String("type", reflect.TypeOf(anyV).String()))
+		return rt.NilValue
+	}
+}
+
 func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath string) (bool, error) {
 	// we need to run every script for every user we know, and add to posts table for each script that allowed the post
 	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'ready'")
@@ -502,6 +545,7 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 	}
 	usedRuntimes := make([]uint64, 0)
 	var hadAnyAllowed bool
+	recAsTable := recToTable(record)
 	for rows.Next() {
 		var fromDid string
 		err := rows.Scan(&fromDid)
@@ -509,13 +553,29 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 			slog.Error("error scanning scrape state did", slog.Any("err", err))
 			continue
 		}
-		fmt.Println(fromDid)
 
 		rows, err := ff.db.Query(`SELECT slot, script FROM scripts WHERE from_did = $1`, fromDid)
 		if err != nil {
 			slog.Error("error querying script rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
+
+		followersTable := rt.NewTable()
+		followersRows, err := ff.db.Query("SELECT to_did FROM follow_relationships WHERE from_did = ?", fromDid)
+		if err != nil {
+			slog.Error("error querying followers rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			continue
+		}
+		for followersRows.Next() {
+			var followingDid string
+			err = followersRows.Scan(&followingDid)
+			if err != nil {
+				slog.Error("error querying follower row from did", slog.Any("err", err), slog.String("from_did", fromDid))
+				continue
+			}
+			followersTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
+		}
+
 		for rows.Next() {
 			var script Script
 			err = rows.Scan(&script.Slot, &script.Text)
@@ -540,7 +600,8 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 			// TODO: add post, follow list, etc, to script context
 			_ = record
 			t := rt.NewTable()
-			t.Set(rt.StringValue("a"), rt.IntValue(1))
+			t.Set(rt.StringValue("post"), recAsTable)
+			t.Set(rt.StringValue("followers"), rt.TableValue(followersTable))
 			runtime.rt.PushContext(rt.RuntimeContextDef{
 				HardLimits: rt.RuntimeResources{
 					Memory: 100000,
