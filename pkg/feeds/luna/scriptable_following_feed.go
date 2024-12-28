@@ -620,20 +620,35 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 			continue
 		}
 
-		followersTable := rt.NewTable()
-		followersRows, err := ff.db.Query("SELECT to_did FROM follow_relationships WHERE from_did = ?", fromDid)
+		followsTable := rt.NewTable()
+		followsRows, err := ff.db.Query("SELECT to_did FROM follow_relationships WHERE from_did = ?", fromDid)
 		if err != nil {
-			slog.Error("error querying followers rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
-		for followersRows.Next() {
+		for followsRows.Next() {
 			var followingDid string
-			err = followersRows.Scan(&followingDid)
+			err = followsRows.Scan(&followingDid)
 			if err != nil {
-				slog.Error("error querying follower row from did", slog.Any("err", err), slog.String("from_did", fromDid))
+				slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
 				continue
 			}
-			followersTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
+			followsTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
+		}
+		followedTable := rt.NewTable()
+		followedRows, err := ff.db.Query("SELECT from_did FROM follow_relationships WHERE to_did = ?", fromDid)
+		if err != nil {
+			slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			continue
+		}
+		for followedRows.Next() {
+			var followingDid string
+			err = followsRows.Scan(&followingDid)
+			if err != nil {
+				slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
+				continue
+			}
+			followedTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
 		}
 
 		for rows.Next() {
@@ -657,11 +672,11 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 			usedRuntimes = append(usedRuntimes, runtime.hash)
 
 			// NOTE: this gives the overall post context to the script
-			// TODO: add post, follow list, etc, to script context
-			_ = record
 			t := rt.NewTable()
 			t.Set(rt.StringValue("post"), recAsTable)
-			t.Set(rt.StringValue("followers"), rt.TableValue(followersTable))
+			// TODO optimize if a script doesn't request the follower/follow lists (e.g word scripts)
+			t.Set(rt.StringValue("follows"), rt.TableValue(followsTable))
+			t.Set(rt.StringValue("followed"), rt.TableValue(followedTable))
 			runtime.rt.PushContext(rt.RuntimeContextDef{
 				HardLimits: rt.RuntimeResources{
 					Memory: 100000,
