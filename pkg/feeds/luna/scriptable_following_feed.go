@@ -37,12 +37,13 @@ import (
 )
 
 type ScriptableFollowingFeed struct {
-	FeedActorDID string
-	FeedName     string
-	db           *sql.DB
-	relayAddress string
-	appviewUrl   string
-	runtimes     map[uint64]ScriptRuntime
+	FeedActorDID  string
+	FeedName      string
+	db            *sql.DB
+	relayAddress  string
+	appviewUrl    string
+	runtimes      map[uint64]ScriptRuntime
+	reportChannel chan int
 }
 
 type ScriptRuntime struct {
@@ -269,6 +270,7 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 	ff.db = db
 	go ff.main(ctx)
 	go ff.scrapeFollowers(ctx)
+	go ff.runReports()
 }
 
 func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
@@ -279,6 +281,41 @@ func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
 		}
 		slog.Info("firehose consumer stopped, restarting in 3 seconds")
 		time.Sleep(3 * time.Second)
+	}
+}
+
+const (
+	PROCESSED_POST int = 1
+	ALLOWED_POST   int = 2
+	INCOMING_POST  int = 3
+)
+
+type Counters struct {
+	incoming  uint
+	processed uint
+	allowed   uint
+}
+
+func (ff *ScriptableFollowingFeed) runReports() {
+	counters := Counters{}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case report := <-ff.reportChannel:
+			switch report {
+			case ALLOWED_POST:
+				counters.allowed++
+			case PROCESSED_POST:
+				counters.processed++
+			case INCOMING_POST:
+				counters.incoming++
+			}
+		case <-ticker.C:
+			slog.Info("report", slog.Int("processed", int(counters.processed)), slog.Int("allowed", int(counters.allowed)), slog.Int("incoming", int(counters.incoming)))
+			counters = Counters{}
+		}
 	}
 }
 
@@ -457,6 +494,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 						}
 					}
 				case "app.bsky.feed.post":
+					ff.reportChannel <- INCOMING_POST
 					rec, err := data.UnmarshalCBOR(recordData)
 					if err != nil {
 						continue
@@ -469,9 +507,11 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 						continue
 					}
 					// if none of the scripts allowed the post, we don't need to store it
+					ff.reportChannel <- PROCESSED_POST
 					if !ok {
 						continue
 					}
+					ff.reportChannel <- ALLOWED_POST
 
 					row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
 					var maybeCurrentMaxIndex *uint64
