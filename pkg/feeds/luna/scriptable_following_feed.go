@@ -41,14 +41,15 @@ import (
 )
 
 type ScriptableFollowingFeed struct {
-	FeedActorDID  string
-	FeedName      string
-	DatabasePath  string
-	db            *sql.DB
-	relayAddress  string
-	appviewUrl    string
-	runtimes      map[uint64]ScriptRuntime
-	reportChannel chan int
+	FeedActorDID           string
+	FeedName               string
+	DatabasePath           string
+	db                     *sql.DB
+	relayAddress           string
+	appviewUrl             string
+	runtimes               map[uint64]ScriptRuntime
+	reportChannel          chan int
+	restartFirehoseChannel chan bool
 }
 
 type ScriptRuntime struct {
@@ -268,12 +269,18 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 }
 
 func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
+	errorChannel := make(chan error, 1)
+	exitChannel := make(chan bool, 1)
 	for {
-		err := ff.firehoseConsumer(ctx)
-		if err != nil {
-			slog.Error("error in firehose consumer", slog.Any("err", err))
+		go ff.firehoseConsumer(ctx, errorChannel, exitChannel)
+		select {
+		case err := <-errorChannel:
+			slog.Error("error in firehose consumer, restarting", slog.Any("err", err))
+		case <-ff.restartFirehoseChannel:
+			slog.Error("restart requested")
+			exitChannel <- true
 		}
-		slog.Info("firehose consumer stopped, restarting in 3 seconds")
+		slog.Info("sleeping for 3 seconds before restart")
 		time.Sleep(3 * time.Second)
 	}
 }
@@ -295,6 +302,8 @@ func (ff *ScriptableFollowingFeed) runReports() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	badIncomingCounter := 0
+
 	for {
 		select {
 		case report := <-ff.reportChannel:
@@ -307,6 +316,14 @@ func (ff *ScriptableFollowingFeed) runReports() {
 				counters.incoming++
 			}
 		case <-ticker.C:
+			if counters.processed == 0 {
+				log.Printf("no events for %d amount of seconds", badIncomingCounter)
+				badIncomingCounter++
+			}
+			if badIncomingCounter > 20 {
+				log.Printf("assuming connection went to shit", badIncomingCounter)
+				ff.restartFirehoseChannel <- true
+			}
 			slog.Info("report", slog.Int("processed", int(counters.processed)), slog.Int("allowed", int(counters.allowed)), slog.Int("incoming", int(counters.incoming)))
 			counters = Counters{}
 		}
@@ -443,13 +460,13 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 				slog.Debug("incoming event", slog.String("path", op.Path), slog.Any("cid", op.Cid), slog.String("action", op.Action), slog.String("repo", evt.Repo))
 				rcid, recBytes, err := rr.GetRecordBytes(ctx, op.Path)
 				if err != nil {
-					return nil
+					continue
 				}
 				slog.Debug("event", slog.String("rcid", rcid.String()))
 
 				recordType, recordData, err := data.ExtractTypeCBORReader(bytes.NewReader(*recBytes))
 				if err != nil {
-					return nil
+					continue
 				}
 				slog.Debug("record", slog.String("record", recordType))
 
@@ -535,7 +552,15 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 	}
 
 	sched := sequential.NewScheduler("scriptable_following_feed", rsc.EventHandler)
-	return events.HandleRepoStream(context.Background(), con, sched)
+	defer sched.Shutdown()
+
+	go func() {
+		err = events.HandleRepoStream(context.Background(), con, sched)
+		errorChannel <- err
+		exitChannel <- true
+	}()
+
+	<-exitChannel
 }
 
 func recToTable(anyV any) rt.Value {
