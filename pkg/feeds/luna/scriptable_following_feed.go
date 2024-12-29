@@ -418,11 +418,12 @@ func (s Script) Hash() uint64 {
 	return h.Sum64()
 }
 
-func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
+func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorChannel chan error, exitChannel chan bool) {
 	var syncCursorDb *int64
 	err := ff.db.QueryRow(`SELECT max(cursor) FROM firehose_sync_position`).Scan(&syncCursorDb)
 	if err != nil {
-		return err
+		errorChannel <- err
+		return
 	}
 	if syncCursorDb == nil {
 		syncCursorDb = lo.ToPtr(int64(0))
@@ -431,8 +432,10 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context) error {
 	uri := fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", ff.relayAddress, syncCursor)
 	con, _, err := websocket.DefaultDialer.Dial(uri, http.Header{})
 	if err != nil {
-		return err
+		errorChannel <- err
+		return
 	}
+	defer con.Close()
 	defer func() {
 		_, err := ff.db.Exec("INSERT INTO firehose_sync_position (cursor) VALUES (?)", syncCursor)
 		if err != nil {
