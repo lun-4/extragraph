@@ -152,14 +152,14 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 		return nil, nil, fmt.Errorf("unknown slot number: %d", slot)
 	}
 
-	var cursorAsIndex uint64 = math.MaxUint64
+	var cursorAsIndex uint = math.MaxInt64 - 1
 	if cursor != "" {
-		cursorAsIndexParsed, err := strconv.ParseUint(cursor, 10, 64)
+		cursorAsIndexParsed, err := strconv.ParseUint(cursor, 10, 32)
 		if err != nil {
 			slog.Error("cursor invalid", slog.String("cursor", cursor), slog.Any("err", err))
 			return nil, nil, err
 		}
-		cursorAsIndex = cursorAsIndexParsed
+		cursorAsIndex = uint(cursorAsIndexParsed)
 	}
 
 	query := `
@@ -181,18 +181,19 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 		return nil, nil, err
 	}
 
-	var maxIndex uint64
+	var maxIndex uint = math.MaxUint
 	posts := make([]*appbsky.FeedDefs_SkeletonFeedPost, 0)
 	for rows.Next() {
 		var atPath string
-		var index uint64
+		var index uint
 		if err := rows.Scan(&atPath, &index); err != nil {
 			slog.Error("error scanning row", slog.Any("err", err))
-			return nil, nil, err
+			continue
 		}
 		if index < maxIndex {
 			maxIndex = index
 		}
+		fmt.Println(atPath, index, maxIndex)
 		posts = append(posts, &appbsky.FeedDefs_SkeletonFeedPost{
 			Post: atPath,
 		})
