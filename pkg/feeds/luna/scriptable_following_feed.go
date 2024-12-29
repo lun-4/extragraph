@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"reflect"
@@ -150,7 +151,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 		return nil, nil, fmt.Errorf("unknown slot number: %d", slot)
 	}
 
-	var cursorAsIndex uint64
+	var cursorAsIndex uint64 = math.MaxUint64
 	if cursor != "" {
 		cursorAsIndexParsed, err := strconv.ParseUint(cursor, 10, 64)
 		if err != nil {
@@ -166,7 +167,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 		JOIN posts
 			ON allowed_posts.at_path = posts.at_path
 		WHERE
-			posts.counter > ?
+			posts.counter < ?
 		AND allowed_posts.from_did = ?
 		AND allowed_posts.slot = ?
 		ORDER BY counter DESC`
@@ -188,7 +189,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 			slog.Error("error scanning row", slog.Any("err", err))
 			return nil, nil, err
 		}
-		if index > maxIndex {
+		if index < maxIndex {
 			maxIndex = index
 		}
 		posts = append(posts, &appbsky.FeedDefs_SkeletonFeedPost{
