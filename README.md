@@ -2,6 +2,20 @@
 
 quick lua-scriptable feedgen
 
+takes you from
+```lua
+return {
+  filter = function(ctx)
+    local hasSubstring = string.find(string.lower(ctx.post.text), "geans") ~= nil
+    return hasSubstring
+  end,
+}
+```
+
+to
+
+![](https://smooch.computer/i/hn6dje7k9xdei.png)
+
 based on very good work by jaz: https://github.com/ericvolp12/go-bsky-feed-generator
 
 ## how
