@@ -76,6 +76,16 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+	case "reset-firehose":
+		res, err := db.Exec(`DELETE FROM firehose_sync_position`)
+		if err != nil {
+			panic(err)
+		}
+		ra, err := res.RowsAffected()
+		if err != nil {
+			panic(err)
+		}
+		log.Println(ra, "rows deleted")
 	case "setscript":
 		did := wantArg(2)
 		slot := wantArgInt(3)

@@ -429,7 +429,12 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 		syncCursorDb = lo.ToPtr(int64(0))
 	}
 	syncCursor := *syncCursorDb
-	uri := fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", ff.relayAddress, syncCursor)
+	var uri string
+	if syncCursor != 0 {
+		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", ff.relayAddress, syncCursor)
+	} else {
+		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos", ff.relayAddress)
+	}
 	con, _, err := websocket.DefaultDialer.Dial(uri, http.Header{})
 	if err != nil {
 		errorChannel <- err
