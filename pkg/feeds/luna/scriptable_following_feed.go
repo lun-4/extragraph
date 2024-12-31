@@ -271,8 +271,8 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 
 func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
 	errorChannel := make(chan error, 1)
-	exitChannel := make(chan bool, 1)
 	for {
+		exitChannel := make(chan bool, 1)
 		go ff.firehoseConsumer(ctx, errorChannel, exitChannel)
 		select {
 		case err := <-errorChannel:
@@ -322,7 +322,7 @@ func (ff *ScriptableFollowingFeed) runReports() {
 				badIncomingCounter++
 			}
 			if badIncomingCounter > 20 {
-				log.Printf("assuming connection went to shit", badIncomingCounter)
+				log.Printf("assuming connection went to shit. we got %d seconds with zero events", badIncomingCounter)
 				ff.restartFirehoseChannel <- true
 			}
 			slog.Info("report", slog.Int("processed", int(counters.processed)), slog.Int("allowed", int(counters.allowed)), slog.Int("incoming", int(counters.incoming)))
@@ -438,6 +438,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 	}
 	con, _, err := websocket.DefaultDialer.Dial(uri, http.Header{})
 	if err != nil {
+		slog.Error("error dialing websocket", slog.Any("err", err))
 		errorChannel <- err
 		return
 	}
