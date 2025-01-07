@@ -522,7 +522,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 					ff.reportChannel <- INCOMING_POST
 
 					atPath := fmt.Sprintf("at://%s/%s", userDid, op.Path)
-					ok, err := ff.handlePost(rec, atPath)
+					ok, err := ff.handlePost(userDid, rec, atPath)
 					if err != nil {
 						slog.Error("error handling post", slog.String("path", atPath), slog.Any("err", err))
 						continue
@@ -619,7 +619,7 @@ func recToTable(anyV any) rt.Value {
 	}
 }
 
-func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath string) (bool, error) {
+func (ff ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
 	// we need to run every script for every user we know, and add to posts table for each script that allowed the post
 	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'ready'")
 	if err != nil {
@@ -696,6 +696,7 @@ func (ff ScriptableFollowingFeed) handlePost(record map[string]any, atPath strin
 
 			// NOTE: this gives the overall post context to the script
 			t := rt.NewTable()
+			t.Set(rt.StringValue("author_did"), rt.StringValue(recordAuthorDid))
 			t.Set(rt.StringValue("post"), recAsTable)
 			// TODO optimize if a script doesn't request the follower/follow lists (e.g word scripts)
 			t.Set(rt.StringValue("follows"), rt.TableValue(followsTable))
