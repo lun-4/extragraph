@@ -423,7 +423,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 	var syncCursorDb *int64
 	err := ff.db.QueryRow(`SELECT max(cursor) FROM firehose_sync_position`).Scan(&syncCursorDb)
 	if err != nil {
-		errorChannel <- err
+		errorChannel <- fmt.Errorf("error fetching firehose sync position: %w", err)
 		return
 	}
 	if syncCursorDb == nil {
@@ -439,7 +439,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 	con, _, err := websocket.DefaultDialer.Dial(uri, http.Header{})
 	if err != nil {
 		slog.Error("error dialing websocket", slog.Any("err", err))
-		errorChannel <- err
+		errorChannel <- fmt.Errorf("error dialing websocket: %w", err)
 		return
 	}
 	defer con.Close()
@@ -568,9 +568,11 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 		err = events.HandleRepoStream(context.Background(), con, sched)
 		errorChannel <- err
 		exitChannel <- true
+		slog.Warn("firehose consumer exiting, sending exit", slog.Any("err", err))
 	}()
 
 	<-exitChannel
+	slog.Warn("firehose consumer exiting, got exit")
 }
 
 func recToTable(anyV any) rt.Value {
