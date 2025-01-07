@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/indigo/api/atproto"
@@ -40,6 +41,47 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+type LockedInt struct {
+	mut sync.Mutex
+	ui  uint
+}
+
+func (li *LockedInt) Incr() {
+	li.Lock()
+	defer li.Unlock()
+	li.ui++
+}
+
+func (li *LockedInt) Lock() {
+	li.mut.Lock()
+}
+func (li *LockedInt) Unlock() {
+	li.mut.Unlock()
+}
+func (li *LockedInt) UnlockedGet() uint {
+	return li.ui
+}
+
+func (li *LockedInt) LockAndGet() uint {
+	li.Lock()
+	defer li.Unlock()
+	return li.ui
+}
+func (li *LockedInt) LockAndSet(v uint) uint {
+	li.Lock()
+	defer li.Unlock()
+	li.ui = v
+	return li.ui
+}
+
+func (li *LockedInt) Reset() uint {
+	li.Lock()
+	defer li.Unlock()
+	val := li.ui
+	li.ui = 0
+	return val
+}
+
 type ScriptableFollowingFeed struct {
 	FeedActorDID           string
 	FeedName               string
@@ -50,6 +92,7 @@ type ScriptableFollowingFeed struct {
 	runtimes               map[uint64]ScriptRuntime
 	reportChannel          chan int
 	restartFirehoseChannel chan bool
+	syncCursor             LockedInt
 }
 
 type ScriptRuntime struct {
@@ -254,18 +297,13 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 	) STRICT;
 	CREATE INDEX IF NOT EXISTS allowed_posts_from_did_index ON allowed_posts (from_did);
 	CREATE INDEX IF NOT EXISTS allowed_posts_slot_index ON allowed_posts (slot);
-
-	CREATE TABLE IF NOT EXISTS firehose_sync_position (
-		cursor int
-	) STRICT;
-	CREATE INDEX IF NOT EXISTS firehose_sync_position_cursor_index ON firehose_sync_position (cursor);
 	`)
 	if err != nil {
 		panic(err)
 	}
 	ff.db = db
 	go ff.main(ctx)
-	go ff.scrapeFollowers(ctx)
+	go ff.scrapeFollowers()
 	go ff.runReports()
 }
 
@@ -331,7 +369,7 @@ func (ff *ScriptableFollowingFeed) runReports() {
 	}
 }
 
-func (ff *ScriptableFollowingFeed) scrapeNewAccounts(ctx context.Context) error {
+func (ff *ScriptableFollowingFeed) scrapeNewAccounts() error {
 	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'pending'")
 	if err != nil {
 		return fmt.Errorf("error querying scrape state: %w", err)
@@ -398,9 +436,9 @@ func (ff *ScriptableFollowingFeed) scrapeNewAccounts(ctx context.Context) error 
 	}
 	return nil
 }
-func (ff *ScriptableFollowingFeed) scrapeFollowers(ctx context.Context) {
+func (ff *ScriptableFollowingFeed) scrapeFollowers() {
 	for {
-		err := ff.scrapeNewAccounts(ctx)
+		err := ff.scrapeNewAccounts()
 		if err != nil {
 			slog.Error("error in follower scraper", slog.Any("err", err))
 		}
@@ -420,19 +458,11 @@ func (s Script) Hash() uint64 {
 }
 
 func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorChannel chan error, exitChannel chan bool) {
-	var syncCursorDb *int64
-	err := ff.db.QueryRow(`SELECT max(cursor) FROM firehose_sync_position`).Scan(&syncCursorDb)
-	if err != nil {
-		errorChannel <- fmt.Errorf("error fetching firehose sync position: %w", err)
-		return
-	}
-	if syncCursorDb == nil {
-		syncCursorDb = lo.ToPtr(int64(0))
-	}
-	syncCursor := *syncCursorDb
 	var uri string
-	if syncCursor != 0 {
-		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", ff.relayAddress, syncCursor)
+	cursor := ff.syncCursor.LockAndGet()
+	if cursor != 0 {
+		slog.Info("resuming from cursor", slog.Uint64("cursor", uint64(cursor)))
+		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", ff.relayAddress, cursor)
 	} else {
 		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos", ff.relayAddress)
 	}
@@ -443,23 +473,10 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 		return
 	}
 	defer con.Close()
-	defer func() {
-		_, err := ff.db.Exec("INSERT INTO firehose_sync_position (cursor) VALUES (?)", syncCursor)
-		if err != nil {
-			panic(err)
-		}
-	}()
 	rsc := &events.RepoStreamCallbacks{
 		RepoCommit: func(evt *atproto.SyncSubscribeRepos_Commit) error {
+			ff.syncCursor.LockAndSet(uint(evt.Seq))
 
-			// sync the cursor every 2000 events (approximately every second or couple of seconds)
-			if (evt.Seq - syncCursor) > 2000 {
-				_, err := ff.db.Exec("INSERT INTO firehose_sync_position (cursor) VALUES (?)", syncCursor)
-				if err != nil {
-					slog.Error("error inserting cursor to firehose_sync_position", slog.String("err", err.Error()))
-				}
-				syncCursor = evt.Seq
-			}
 			rr, err := repo.ReadRepoFromCar(ctx, bytes.NewReader(evt.Blocks))
 			if err != nil {
 				return nil
@@ -621,7 +638,7 @@ func recToTable(anyV any) rt.Value {
 	}
 }
 
-func (ff ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
+func (ff *ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
 	// we need to run every script for every user we know, and add to posts table for each script that allowed the post
 	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'ready'")
 	if err != nil {
