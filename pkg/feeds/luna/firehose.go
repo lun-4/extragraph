@@ -138,7 +138,9 @@ func (ff *FollowingFeed) discoverPage(ctx context.Context, userDID string, limit
 	slog.Info("discover feed page", slog.String("user", userDID), slog.Int64("limit", limit), slog.String("cursor", cursor))
 	var cursorAsIndex uint = math.MaxInt64 - 1
 
-	if cursor != "" {
+	if strings.Contains(cursor, "__") { // idk why social-app does that kind of thing to me
+		// ignore their cursor. do nothing
+	} else if cursor != "" {
 		cursorAsIndexR, err := strconv.ParseUint(cursor, 10, 64)
 		if err != nil {
 			slog.Error("cursor invalid", slog.String("cursor", cursor), slog.Any("err", err))
@@ -154,7 +156,7 @@ func (ff *FollowingFeed) discoverPage(ctx context.Context, userDID string, limit
 		WHERE counter < ?
 		ORDER BY counter DESC`
 
-	query += fmt.Sprintf("LIMIT %d", limit)
+	query += fmt.Sprintf(" LIMIT %d", limit)
 
 	fmt.Println(query, cursorAsIndex)
 	rows, err := ff.db.Query(query, cursorAsIndex)
@@ -228,8 +230,8 @@ func (ff *FollowingFeed) GetPage(ctx context.Context, feed string, userDID strin
 		query += ` counter < ?`
 	}
 	args = append(args, cursorAsIndex)
-	query += `ORDER BY counter DESC `
-	query += fmt.Sprintf("LIMIT %d", limit)
+	query += `ORDER BY counter DESC`
+	query += fmt.Sprintf(" LIMIT %d", limit)
 
 	fmt.Println(query)
 	rows, err := ff.db.Query(query, args...)
