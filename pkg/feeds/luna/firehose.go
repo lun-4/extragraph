@@ -46,8 +46,8 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 	feeds := make([]DynamicFeed, 0)
 	if os.Getenv("FOLLOWING_FEED_ENABLE") == "1" {
 		feeds = append(feeds, &FollowingFeed{
-			FeedActorDID: os.Getenv("SCRIPTABLE_FOLLOWING_FEED_ACTOR_DID"),
-			FeedName:     os.Getenv("SCRIPTABLE_FOLLOWING_FEED_NAME"),
+			FeedActorDID: os.Getenv("FOLLOWING_FEED_ACTOR_DID"),
+			FeedName:     os.Getenv("FOLLOWING_FEED_NAME"),
 			relayAddress: relayAddress,
 		})
 	} else {
