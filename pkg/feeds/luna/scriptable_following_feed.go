@@ -224,7 +224,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 		return nil, nil, err
 	}
 
-	var maxIndex uint = math.MaxUint
+	var minIndex uint = math.MaxUint
 	posts := make([]*appbsky.FeedDefs_SkeletonFeedPost, 0)
 	for rows.Next() {
 		var atPath string
@@ -233,16 +233,16 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 			slog.Error("error scanning row", slog.Any("err", err))
 			continue
 		}
-		if index < maxIndex {
-			maxIndex = index
+		if index < minIndex {
+			minIndex = index
 		}
-		fmt.Println(atPath, index, maxIndex)
+		fmt.Println(atPath, index, minIndex)
 		posts = append(posts, &appbsky.FeedDefs_SkeletonFeedPost{
 			Post: atPath,
 		})
 	}
 
-	newCursor := fmt.Sprintf("%d", maxIndex)
+	newCursor := fmt.Sprintf("%d", minIndex)
 
 	return posts, lo.ToPtr(newCursor), nil
 }

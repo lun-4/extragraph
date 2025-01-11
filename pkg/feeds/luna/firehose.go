@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -46,9 +47,10 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 	feeds := make([]DynamicFeed, 0)
 	if os.Getenv("FOLLOWING_FEED_ENABLE") == "1" {
 		feeds = append(feeds, &FollowingFeed{
-			FeedActorDID: os.Getenv("FOLLOWING_FEED_ACTOR_DID"),
-			FeedName:     os.Getenv("FOLLOWING_FEED_NAME"),
-			relayAddress: relayAddress,
+			FeedActorDID:     os.Getenv("FOLLOWING_FEED_ACTOR_DID"),
+			FeedName:         os.Getenv("FOLLOWING_FEED_NAME"),
+			DiscoverFeedName: os.Getenv("DISCOVER_FEED_NAME"),
+			relayAddress:     relayAddress,
 		})
 	} else {
 		slog.Warn("Following feed is disabled")
@@ -80,23 +82,33 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 }
 
 type FollowingFeed struct {
-	FeedActorDID string
-	FeedName     string
-	db           *sql.DB
-	relayAddress string
-	appviewUrl   string
+	FeedActorDID     string
+	FeedName         string
+	DiscoverFeedName string
+	db               *sql.DB
+	relayAddress     string
+	appviewUrl       string
 }
 
 func (ff *FollowingFeed) Describe(ctx context.Context) ([]appbsky.FeedDescribeFeedGenerator_Feed, error) {
-	return []appbsky.FeedDescribeFeedGenerator_Feed{
-		{
-			Uri: "at://" + ff.FeedActorDID + "/app.bsky.feed.generator/" + ff.FeedName,
-		},
-	}, nil
+	feeds := make([]appbsky.FeedDescribeFeedGenerator_Feed, 0)
+	feeds = append(feeds, appbsky.FeedDescribeFeedGenerator_Feed{
+		Uri: "at://" + ff.FeedActorDID + "/app.bsky.feed.generator/" + ff.FeedName,
+	})
+	if ff.DiscoverFeedName != "" {
+		feeds = append(feeds, appbsky.FeedDescribeFeedGenerator_Feed{
+			Uri: "at://" + ff.FeedActorDID + "/app.bsky.feed.generator/" + ff.DiscoverFeedName,
+		})
+	}
+	return feeds, nil
 }
 
 func (ff *FollowingFeed) GetFeedNames() []string {
-	return []string{ff.FeedName}
+	fns := []string{ff.FeedName}
+	if ff.DiscoverFeedName != "" {
+		fns = append(fns, ff.DiscoverFeedName)
+	}
+	return fns
 }
 
 func (ff *FollowingFeed) getFollowing(userDID string) ([]string, error) {
@@ -121,7 +133,63 @@ func (ff *FollowingFeed) getFollowing(userDID string) ([]string, error) {
 	return dids, nil
 }
 
+func (ff *FollowingFeed) discoverPage(ctx context.Context, userDID string, limit int64, cursor string) ([]*appbsky.FeedDefs_SkeletonFeedPost, *string, error) {
+	_ = ctx
+	slog.Info("discover feed page", slog.String("user", userDID), slog.Int64("limit", limit), slog.String("cursor", cursor))
+	var cursorAsIndex uint = math.MaxInt64 - 1
+
+	if cursor != "" {
+		cursorAsIndexR, err := strconv.ParseUint(cursor, 10, 64)
+		if err != nil {
+			slog.Error("cursor invalid", slog.String("cursor", cursor), slog.Any("err", err))
+			return nil, nil, err
+		}
+		cursorAsIndex = uint(cursorAsIndexR)
+	}
+
+	// hack for now
+	query := `
+		SELECT at_path, counter
+		FROM posts
+		WHERE counter < ?
+		ORDER BY counter DESC`
+
+	query += fmt.Sprintf("LIMIT %d", limit)
+
+	fmt.Println(query, cursorAsIndex)
+	rows, err := ff.db.Query(query, cursorAsIndex)
+	if err != nil {
+		slog.Error("error getting posts", slog.String("user", userDID), slog.Any("err", err))
+		return nil, nil, err
+	}
+
+	var minIndex uint = math.MaxUint
+	posts := make([]*appbsky.FeedDefs_SkeletonFeedPost, 0)
+	for rows.Next() {
+		var atPath string
+		var index uint
+		if err := rows.Scan(&atPath, &index); err != nil {
+			slog.Error("error scanning row", slog.Any("err", err))
+			continue
+		}
+		if index < minIndex {
+			minIndex = index
+		}
+		fmt.Println(atPath, index, minIndex)
+		posts = append(posts, &appbsky.FeedDefs_SkeletonFeedPost{
+			Post: atPath,
+		})
+	}
+
+	newCursor := fmt.Sprintf("%d", minIndex)
+
+	return posts, lo.ToPtr(newCursor), nil
+}
+
 func (ff *FollowingFeed) GetPage(ctx context.Context, feed string, userDID string, limit int64, cursor string) ([]*appbsky.FeedDefs_SkeletonFeedPost, *string, error) {
+	if ff.DiscoverFeedName != "" && feed == ff.DiscoverFeedName {
+		return ff.discoverPage(ctx, userDID, limit, cursor)
+	}
 	slog.Info("following feed page", slog.String("feed", feed), slog.String("user", userDID), slog.Int64("limit", limit), slog.String("cursor", cursor))
 
 	following, err := ff.getFollowing(userDID)
@@ -129,14 +197,15 @@ func (ff *FollowingFeed) GetPage(ctx context.Context, feed string, userDID strin
 		slog.Error("error getting following", slog.String("user", userDID), slog.Any("err", err))
 		return nil, nil, err
 	}
-	var cursorAsIndex uint64
 
+	var cursorAsIndex uint = math.MaxInt64 - 1
 	if cursor != "" {
-		cursorAsIndex, err = strconv.ParseUint(cursor, 10, 64)
+		cursorAsIndexParsed, err := strconv.ParseUint(cursor, 10, 32)
 		if err != nil {
 			slog.Error("cursor invalid", slog.String("cursor", cursor), slog.Any("err", err))
 			return nil, nil, err
 		}
+		cursorAsIndex = uint(cursorAsIndexParsed)
 	}
 
 	// hack for now
@@ -154,9 +223,9 @@ func (ff *FollowingFeed) GetPage(ctx context.Context, feed string, userDID strin
 	}
 	query += strings.Join(clauses, "OR")
 	if len(clauses) > 0 {
-		query += `AND counter > ? `
+		query += `AND counter < ? `
 	} else {
-		query += ` counter > ?`
+		query += ` counter < ?`
 	}
 	args = append(args, cursorAsIndex)
 	query += `ORDER BY counter DESC `
@@ -168,24 +237,25 @@ func (ff *FollowingFeed) GetPage(ctx context.Context, feed string, userDID strin
 		slog.Error("error getting posts", slog.String("user", userDID), slog.Any("err", err))
 		return nil, nil, err
 	}
-	var maxIndex uint64
+	var minIndex uint = math.MaxUint
 	posts := make([]*appbsky.FeedDefs_SkeletonFeedPost, 0)
 	for rows.Next() {
 		var atPath string
-		var index uint64
+		var index uint
 		if err := rows.Scan(&atPath, &index); err != nil {
 			slog.Error("error scanning row", slog.Any("err", err))
-			return nil, nil, err
+			continue
 		}
-		if index > maxIndex {
-			maxIndex = index
+		if index < minIndex {
+			minIndex = index
 		}
+		fmt.Println(atPath, index, minIndex)
 		posts = append(posts, &appbsky.FeedDefs_SkeletonFeedPost{
 			Post: atPath,
 		})
 	}
 
-	newCursor := fmt.Sprintf("%d", maxIndex)
+	newCursor := fmt.Sprintf("%d", minIndex)
 
 	return posts, lo.ToPtr(newCursor), nil
 }
@@ -205,7 +275,13 @@ func (ff *FollowingFeed) Spawn(ctx context.Context) {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
 
-	db, err := sql.Open("sqlite3", "follower_feed_state.db")
+	dbPath := os.Getenv("FOLLOWING_FEED_DATABASE_PATH")
+	if dbPath == "" {
+		slog.Warn("Following feed database path not set, using default")
+		dbPath = "follower_feed_state.db"
+	}
+
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
