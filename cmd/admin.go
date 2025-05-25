@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -90,6 +91,15 @@ func main() {
 		did := wantArg(2)
 		slot := wantArgInt(3)
 		scriptPath := wantArg(4)
+
+		row := db.QueryRow(`SELECT state FROM scrape_state WHERE from_did = $1`, did)
+		var st string
+		err := row.Scan(&st)
+		if errors.Is(err, sql.ErrNoRows) {
+			fmt.Println("did", did, "is not on scrape_state, did you run adduser?")
+			return
+		}
+
 		fd, err := os.Open(scriptPath)
 		if err != nil {
 			log.Fatalln("can't open script", scriptPath, ":", err.Error())
