@@ -569,6 +569,44 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 					} else {
 						slog.Debug("post created", slog.String("at", atPath))
 					}
+				case "app.bsky.feed.repost":
+					rec, err := data.UnmarshalCBOR(recordData)
+					if err != nil {
+						continue
+					}
+					ff.reportChannel <- INCOMING_POST
+
+					atPath := fmt.Sprintf("at://%s/%s", userDid, op.Path)
+					ok, err := ff.handleRepost(userDid, rec, atPath)
+					if err != nil {
+						slog.Error("error handling repost", slog.String("path", atPath), slog.Any("err", err))
+						continue
+					}
+					// if none of the scripts allowed the repost, we don't need to store it
+					ff.reportChannel <- PROCESSED_POST
+					if !ok {
+						continue
+					}
+					ff.reportChannel <- ALLOWED_POST
+
+					row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
+					var maybeCurrentMaxIndex *uint64
+					err = row.Scan(&maybeCurrentMaxIndex)
+					if err != nil {
+						slog.Error("error getting max index", slog.Any("err", err))
+						continue
+					}
+
+					var newIndex uint64
+					if maybeCurrentMaxIndex != nil {
+						newIndex = *maybeCurrentMaxIndex + 1
+					}
+					_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
+					if err != nil {
+						slog.Error("error inserting post", slog.Any("err", err))
+					} else {
+						slog.Debug("repost created", slog.String("at", atPath))
+					}
 				default:
 					slog.Debug("unknown record type, ignoring", slog.String("record", recordType))
 				}
@@ -638,8 +676,8 @@ func recToTable(anyV any) rt.Value {
 	}
 }
 
-func (ff *ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
-	// we need to run every script for every user we know, and add to posts table for each script that allowed the post
+func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record map[string]any, atPath string, recordType string) (bool, error) {
+	// we need to run every script for every user we know, and add to posts table for each script that allowed the record
 	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'ready'")
 	if err != nil {
 		slog.Error("error querying scrape state", slog.Any("err", err))
@@ -713,10 +751,16 @@ func (ff *ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map
 			}
 			usedRuntimes = append(usedRuntimes, runtime.hash)
 
-			// NOTE: this gives the overall post context to the script
+			// Build context table based on record type
 			t := rt.NewTable()
 			t.Set(rt.StringValue("author_did"), rt.StringValue(recordAuthorDid))
-			t.Set(rt.StringValue("post"), recAsTable)
+			if recordType == "post" {
+				t.Set(rt.StringValue("post"), recAsTable)
+				t.Set(rt.StringValue("repost"), rt.NilValue)
+			} else {
+				t.Set(rt.StringValue("post"), rt.NilValue)
+				t.Set(rt.StringValue("repost"), recAsTable)
+			}
 			// TODO optimize if a script doesn't request the follower/follow lists (e.g word scripts)
 			t.Set(rt.StringValue("follows"), rt.TableValue(followsTable))
 			t.Set(rt.StringValue("followed"), rt.TableValue(followedTable))
@@ -741,7 +785,7 @@ func (ff *ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map
 				if err != nil {
 					slog.Error("error inserting allowed post", slog.Any("err", err))
 				} else {
-					slog.Debug("allowed post created", slog.String("at", atPath), slog.String("from", fromDid))
+					slog.Debug("allowed "+recordType+" created", slog.String("at", atPath), slog.String("from", fromDid))
 				}
 			}
 		}
@@ -756,4 +800,12 @@ func (ff *ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map
 	}
 
 	return hadAnyAllowed, nil
+}
+
+func (ff *ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
+	return ff.handleRecord(recordAuthorDid, record, atPath, "post")
+}
+
+func (ff *ScriptableFollowingFeed) handleRepost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
+	return ff.handleRecord(recordAuthorDid, record, atPath, "repost")
 }
