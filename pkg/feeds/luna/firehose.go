@@ -287,7 +287,6 @@ func (ff *FollowingFeed) Spawn(ctx context.Context) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	//	defer db.Close()
 
 	// TODO rest of tables
 	_, err = db.Exec(`
@@ -326,6 +325,7 @@ func (ff *FollowingFeed) Spawn(ctx context.Context) {
 }
 
 func (ff *FollowingFeed) main(ctx context.Context) {
+	defer ff.db.Close()
 	for {
 		err := ff.firehoseConsumer(ctx)
 		if err != nil {

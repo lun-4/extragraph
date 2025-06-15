@@ -252,7 +252,6 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	//	defer db.Close()
 
 	_, err = db.Exec(`
 	PRAGMA journal_mode=WAL;
@@ -309,6 +308,7 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 
 func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
 	errorChannel := make(chan error, 1)
+	defer ff.db.Close()
 	for {
 		exitChannel := make(chan bool, 1)
 		go ff.firehoseConsumer(ctx, errorChannel, exitChannel)
