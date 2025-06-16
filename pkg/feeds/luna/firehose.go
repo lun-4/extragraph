@@ -120,6 +120,7 @@ func (ff *FollowingFeed) getFollowing(userDID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	dids := make([]string, 0)
 	for rows.Next() {

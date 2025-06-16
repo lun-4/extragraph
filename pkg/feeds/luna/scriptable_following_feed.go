@@ -679,6 +679,117 @@ func recToTable(anyV any) rt.Value {
 	}
 }
 
+func (ff *ScriptableFollowingFeed) processScriptsForUser(
+	fromDid string, recordAuthorDid string,
+	atPath string, recordType string, recAsTable rt.Value) (bool, []uint64, error) {
+	var usedRuntimes []uint64
+	var hadAnyAllowed bool
+
+	scriptRows, err := ff.db.Query(`SELECT slot, script FROM scripts WHERE from_did = $1`, fromDid)
+	if err != nil {
+		slog.Error("error querying script rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
+		return false, nil, err
+	}
+	defer scriptRows.Close()
+
+	followsTable := rt.NewTable()
+	followsRows, err := ff.db.Query("SELECT to_did FROM follow_relationships WHERE from_did = ?", fromDid)
+	if err != nil {
+		slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
+		return false, nil, err
+	}
+	defer followsRows.Close()
+
+	for followsRows.Next() {
+		var followingDid string
+		err = followsRows.Scan(&followingDid)
+		if err != nil {
+			slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			continue
+		}
+		followsTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
+	}
+
+	followedTable := rt.NewTable()
+	followedRows, err := ff.db.Query("SELECT from_did FROM follow_relationships WHERE to_did = ?", fromDid)
+	if err != nil {
+		slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
+		return false, nil, err
+	}
+	defer followedRows.Close()
+
+	for followedRows.Next() {
+		var followingDid string
+		err = followedRows.Scan(&followingDid)
+		if err != nil {
+			slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			continue
+		}
+		followedTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
+	}
+
+	for scriptRows.Next() {
+		var script Script
+		err = scriptRows.Scan(&script.Slot, &script.Text)
+		if err != nil {
+			slog.Error("error querying script row from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			continue
+		}
+
+		runtime, found := ff.runtimes[script.Hash()]
+		if !found {
+			newRuntime, err := Compile(script)
+			if err != nil {
+				slog.Error("error compiling script", slog.Any("err", err), slog.String("from_did", fromDid), slog.Int64("slot", script.Slot))
+				continue
+			}
+			ff.runtimes[script.Hash()] = newRuntime
+			runtime = newRuntime
+		}
+		usedRuntimes = append(usedRuntimes, runtime.hash)
+
+		// Build context table based on record type
+		t := rt.NewTable()
+		t.Set(rt.StringValue("author_did"), rt.StringValue(recordAuthorDid))
+		if recordType == "post" {
+			t.Set(rt.StringValue("post"), recAsTable)
+			t.Set(rt.StringValue("repost"), rt.NilValue)
+		} else {
+			t.Set(rt.StringValue("post"), rt.NilValue)
+			t.Set(rt.StringValue("repost"), recAsTable)
+		}
+		// TODO optimize if a script doesn't request the follower/follow lists (e.g word scripts)
+		t.Set(rt.StringValue("follows"), rt.TableValue(followsTable))
+		t.Set(rt.StringValue("followed"), rt.TableValue(followedTable))
+		runtime.rt.PushContext(rt.RuntimeContextDef{
+			HardLimits: rt.RuntimeResources{
+				Memory: 100000,
+				Cpu:    1000000,
+				Millis: 300,
+			},
+			RequiredFlags: rt.ComplyIoSafe | rt.ComplyCpuSafe | rt.ComplyMemSafe | rt.ComplyTimeSafe,
+		})
+		allowed, err := rt.Call1(runtime.rt.MainThread(), runtime.filterFunc, rt.TableValue(t))
+		_ = runtime.rt.PopContext()
+		if err != nil {
+			slog.Error("error calling script", slog.Any("err", err), slog.String("from_did", fromDid))
+			continue
+		}
+		isAllowed := allowed.AsBool()
+		if isAllowed {
+			hadAnyAllowed = true
+			_, err = ff.db.Exec(`INSERT INTO allowed_posts (from_did, slot, at_path) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, fromDid, script.Slot, atPath)
+			if err != nil {
+				slog.Error("error inserting allowed post", slog.Any("err", err))
+			} else {
+				slog.Debug("allowed "+recordType+" created", slog.String("at", atPath), slog.String("from", fromDid))
+			}
+		}
+	}
+
+	return hadAnyAllowed, usedRuntimes, nil
+}
+
 func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record map[string]any, atPath string, recordType string) (bool, error) {
 	// we need to run every script for every user we know, and add to posts table for each script that allowed the record
 	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'ready'")
@@ -687,9 +798,11 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 		return false, err
 	}
 	defer rows.Close()
-	usedRuntimes := make([]uint64, 0)
+
+	allUsedRuntimes := make([]uint64, 0)
 	var hadAnyAllowed bool
 	recAsTable := recToTable(record)
+
 	for rows.Next() {
 		var fromDid string
 		err := rows.Scan(&fromDid)
@@ -698,108 +811,20 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 			continue
 		}
 
-		rows, err := ff.db.Query(`SELECT slot, script FROM scripts WHERE from_did = $1`, fromDid)
+		userHadAllowed, usedRuntimes, err := ff.processScriptsForUser(fromDid, recordAuthorDid, atPath, recordType, recAsTable)
 		if err != nil {
-			slog.Error("error querying script rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
+			slog.Error("error processing scripts for user", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
-		defer rows.Close()
 
-		followsTable := rt.NewTable()
-		followsRows, err := ff.db.Query("SELECT to_did FROM follow_relationships WHERE from_did = ?", fromDid)
-		if err != nil {
-			slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
-			continue
+		if userHadAllowed {
+			hadAnyAllowed = true
 		}
-		defer followsRows.Close()
-		for followsRows.Next() {
-			var followingDid string
-			err = followsRows.Scan(&followingDid)
-			if err != nil {
-				slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
-				continue
-			}
-			followsTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
-		}
-		followedTable := rt.NewTable()
-		followedRows, err := ff.db.Query("SELECT from_did FROM follow_relationships WHERE to_did = ?", fromDid)
-		if err != nil {
-			slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
-			continue
-		}
-		defer followedRows.Close()
-		for followedRows.Next() {
-			var followingDid string
-			err = followsRows.Scan(&followingDid)
-			if err != nil {
-				slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
-				continue
-			}
-			followedTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
-		}
-
-		for rows.Next() {
-			var script Script
-			err = rows.Scan(&script.Slot, &script.Text)
-			if err != nil {
-				slog.Error("error querying script row from did", slog.Any("err", err), slog.String("from_did", fromDid))
-				continue
-			}
-
-			runtime, found := ff.runtimes[script.Hash()]
-			if !found {
-				newRuntime, err := Compile(script)
-				if err != nil {
-					slog.Error("error compiling script", slog.Any("err", err), slog.String("from_did", fromDid), slog.Int64("slot", script.Slot))
-					continue
-				}
-				ff.runtimes[script.Hash()] = newRuntime
-				runtime = newRuntime
-			}
-			usedRuntimes = append(usedRuntimes, runtime.hash)
-
-			// Build context table based on record type
-			t := rt.NewTable()
-			t.Set(rt.StringValue("author_did"), rt.StringValue(recordAuthorDid))
-			if recordType == "post" {
-				t.Set(rt.StringValue("post"), recAsTable)
-				t.Set(rt.StringValue("repost"), rt.NilValue)
-			} else {
-				t.Set(rt.StringValue("post"), rt.NilValue)
-				t.Set(rt.StringValue("repost"), recAsTable)
-			}
-			// TODO optimize if a script doesn't request the follower/follow lists (e.g word scripts)
-			t.Set(rt.StringValue("follows"), rt.TableValue(followsTable))
-			t.Set(rt.StringValue("followed"), rt.TableValue(followedTable))
-			runtime.rt.PushContext(rt.RuntimeContextDef{
-				HardLimits: rt.RuntimeResources{
-					Memory: 100000,
-					Cpu:    1000000,
-					Millis: 300,
-				},
-				RequiredFlags: rt.ComplyIoSafe | rt.ComplyCpuSafe | rt.ComplyMemSafe | rt.ComplyTimeSafe,
-			})
-			allowed, err := rt.Call1(runtime.rt.MainThread(), runtime.filterFunc, rt.TableValue(t))
-			_ = runtime.rt.PopContext()
-			if err != nil {
-				slog.Error("error calling script", slog.Any("err", err), slog.String("from_did", fromDid))
-				continue
-			}
-			isAllowed := allowed.AsBool()
-			if isAllowed {
-				hadAnyAllowed = true
-				_, err = ff.db.Exec(`INSERT INTO allowed_posts (from_did, slot, at_path) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, fromDid, script.Slot, atPath)
-				if err != nil {
-					slog.Error("error inserting allowed post", slog.Any("err", err))
-				} else {
-					slog.Debug("allowed "+recordType+" created", slog.String("at", atPath), slog.String("from", fromDid))
-				}
-			}
-		}
+		allUsedRuntimes = append(allUsedRuntimes, usedRuntimes...)
 	}
 
 	for k, runtime := range ff.runtimes {
-		if !slices.Contains(usedRuntimes, k) {
+		if !slices.Contains(allUsedRuntimes, k) {
 			slog.Warn("runtime not used", slog.Uint64("hash", k))
 			delete(ff.runtimes, runtime.hash)
 			runtime.Cleanup()
