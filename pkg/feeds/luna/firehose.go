@@ -164,6 +164,7 @@ func (ff *FollowingFeed) discoverPage(ctx context.Context, userDID string, limit
 		slog.Error("error getting posts", slog.String("user", userDID), slog.Any("err", err))
 		return nil, nil, err
 	}
+	defer rows.Close()
 
 	var minIndex uint = math.MaxUint
 	posts := make([]*appbsky.FeedDefs_SkeletonFeedPost, 0)
@@ -239,6 +240,7 @@ func (ff *FollowingFeed) GetPage(ctx context.Context, feed string, userDID strin
 		slog.Error("error getting posts", slog.String("user", userDID), slog.Any("err", err))
 		return nil, nil, err
 	}
+	defer rows.Close()
 	var minIndex uint = math.MaxUint
 	posts := make([]*appbsky.FeedDefs_SkeletonFeedPost, 0)
 	for rows.Next() {

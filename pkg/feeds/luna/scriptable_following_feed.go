@@ -165,6 +165,7 @@ func (ff *ScriptableFollowingFeed) getFollowing(userDID string) ([]string, error
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	dids := make([]string, 0)
 	for rows.Next() {
@@ -223,6 +224,7 @@ func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, use
 		slog.Error("error getting posts", slog.String("user", userDID), slog.Any("err", err))
 		return nil, nil, err
 	}
+	defer rows.Close()
 
 	var minIndex uint = math.MaxUint
 	posts := make([]*appbsky.FeedDefs_SkeletonFeedPost, 0)
@@ -374,6 +376,7 @@ func (ff *ScriptableFollowingFeed) scrapeNewAccounts() error {
 	if err != nil {
 		return fmt.Errorf("error querying scrape state: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var fromDid string
 		err := rows.Scan(&fromDid)
@@ -683,6 +686,7 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 		slog.Error("error querying scrape state", slog.Any("err", err))
 		return false, err
 	}
+	defer rows.Close()
 	usedRuntimes := make([]uint64, 0)
 	var hadAnyAllowed bool
 	recAsTable := recToTable(record)
@@ -699,6 +703,7 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 			slog.Error("error querying script rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
+		defer rows.Close()
 
 		followsTable := rt.NewTable()
 		followsRows, err := ff.db.Query("SELECT to_did FROM follow_relationships WHERE from_did = ?", fromDid)
@@ -706,6 +711,7 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 			slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
+		defer followsRows.Close()
 		for followsRows.Next() {
 			var followingDid string
 			err = followsRows.Scan(&followingDid)
@@ -721,6 +727,7 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 			slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
+		defer followedRows.Close()
 		for followedRows.Next() {
 			var followingDid string
 			err = followsRows.Scan(&followingDid)
