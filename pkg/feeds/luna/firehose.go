@@ -346,6 +346,7 @@ func (ff *FollowingFeed) firehoseConsumer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer con.Close()
 	rsc := &events.RepoStreamCallbacks{
 		RepoCommit: func(evt *atproto.SyncSubscribeRepos_Commit) error {
 			rr, err := repo.ReadRepoFromCar(ctx, bytes.NewReader(evt.Blocks))
@@ -419,5 +420,5 @@ func (ff *FollowingFeed) firehoseConsumer(ctx context.Context) error {
 	}
 
 	sched := sequential.NewScheduler("following_feed", rsc.EventHandler)
-	return events.HandleRepoStream(context.Background(), con, sched)
+	return events.HandleRepoStream(ctx, con, sched)
 }
