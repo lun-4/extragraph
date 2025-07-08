@@ -312,15 +312,33 @@ func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
 	errorChannel := make(chan error, 1)
 	defer ff.db.Close()
 	for {
-		exitChannel := make(chan bool, 1)
-		go ff.firehoseConsumer(ctx, errorChannel, exitChannel)
+		// Create a cancellable context for this firehose consumer instance
+		consumerCtx, cancelConsumer := context.WithCancel(ctx)
+		doneChannel := make(chan bool, 1)
+
+		go func() {
+			ff.firehoseConsumer(consumerCtx, errorChannel)
+			doneChannel <- true
+		}()
+
 		select {
 		case err := <-errorChannel:
 			slog.Error("error in firehose consumer, restarting", slog.Any("err", err))
 		case <-ff.restartFirehoseChannel:
 			slog.Error("restart requested")
-			exitChannel <- true
 		}
+
+		// Cancel the context to signal shutdown
+		cancelConsumer()
+
+		// Wait for the goroutine to actually exit (with timeout)
+		select {
+		case <-doneChannel:
+			slog.Info("firehose consumer exited cleanly")
+		case <-time.After(10 * time.Second):
+			slog.Warn("firehose consumer didn't exit within timeout")
+		}
+
 		slog.Info("sleeping for 3 seconds before restart")
 		time.Sleep(3 * time.Second)
 	}
@@ -460,7 +478,7 @@ func (s Script) Hash() uint64 {
 	return h.Sum64()
 }
 
-func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorChannel chan error, exitChannel chan bool) {
+func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorChannel chan error) {
 	var uri string
 	cursor := ff.syncCursor.LockAndGet()
 	if cursor != 0 {
@@ -623,14 +641,13 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 	defer sched.Shutdown()
 
 	go func() {
-		err = events.HandleRepoStream(context.Background(), con, sched)
+		err = events.HandleRepoStream(ctx, con, sched)
 		errorChannel <- err
-		exitChannel <- true
-		slog.Warn("firehose consumer exiting, sending exit", slog.Any("err", err))
+		slog.Warn("firehose consumer exiting", slog.Any("err", err))
 	}()
 
-	<-exitChannel
-	slog.Warn("firehose consumer exiting, got exit")
+	<-ctx.Done()
+	slog.Warn("firehose consumer exiting, context cancelled")
 }
 
 func recToTable(anyV any) rt.Value {
