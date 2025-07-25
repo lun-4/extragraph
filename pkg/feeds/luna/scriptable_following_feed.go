@@ -128,6 +128,11 @@ func Compile(script Script) (ScriptRuntime, error) {
 }
 
 func (sr *ScriptRuntime) Cleanup() {
+	// Clear references first
+	sr.chunk = nil
+	sr.scriptSpec = rt.NilValue
+	sr.filterFunc = rt.NilValue
+
 	for _, cleanup := range sr.cleanups {
 		if cleanup != nil {
 			cleanup()
@@ -136,6 +141,7 @@ func (sr *ScriptRuntime) Cleanup() {
 	sr.rt.MainThread().CollectGarbage()
 	sr.rt = nil
 	sr.chunk = nil
+	sr.cleanups = nil // Clear the cleanup slice
 }
 
 func (ff *ScriptableFollowingFeed) Describe(ctx context.Context) ([]appbsky.FeedDescribeFeedGenerator_Feed, error) {
