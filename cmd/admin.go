@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"strconv"
 
+	extism "github.com/extism/go-sdk"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -57,7 +59,8 @@ func main() {
 		fmt.Println(`
 		ls: list scrape state
 		adduser <did>: add user to scrape
-		setscript <did> <slot> <path>: set script for given slot
+		setscript <did> <slot> <path>: set Lua script for given slot
+		setscript-wasm <did> <slot> <path>: set WASM plugin for given slot
 		`)
 	case "ls":
 		rows, err := db.Query(`SELECT from_did, state FROM scrape_state`)
@@ -110,10 +113,64 @@ func main() {
 			log.Fatalln("can't read script", scriptPath, ":", err.Error())
 		}
 		scriptText := string(scriptBytes)
-		_, err = db.Exec(`INSERT INTO scripts (from_did, slot, script) VALUES (?, ?, ?) ON CONFLICT DO UPDATE SET script = ?`, did, slot, scriptText, scriptText)
+		_, err = db.Exec(`INSERT INTO scripts (from_did, slot, script, script_type) VALUES (?, ?, ?, 'lua') ON CONFLICT DO UPDATE SET script = ?, script_type = 'lua', wasm_bytecode = NULL`, did, slot, scriptText, scriptText)
 		if err != nil {
 			panic(err)
 		}
+		fmt.Println("Lua script set successfully for", did, "slot", slot)
+
+	case "setscript-wasm":
+		did := wantArg(2)
+		slot := wantArgInt(3)
+		wasmPath := wantArg(4)
+
+		row := db.QueryRow(`SELECT state FROM scrape_state WHERE from_did = $1`, did)
+		var st string
+		err := row.Scan(&st)
+		if errors.Is(err, sql.ErrNoRows) {
+			fmt.Println("did", did, "is not on scrape_state, did you run adduser?")
+			return
+		}
+
+		// Read WASM file
+		fd, err := os.Open(wasmPath)
+		if err != nil {
+			log.Fatalln("can't open WASM file", wasmPath, ":", err.Error())
+		}
+		defer fd.Close()
+		wasmBytes, err := io.ReadAll(fd)
+		if err != nil {
+			log.Fatalln("can't read WASM file", wasmPath, ":", err.Error())
+		}
+
+		// Validate WASM module by attempting to load it
+		fmt.Println("Validating WASM module...")
+		manifest := extism.Manifest{
+			Wasm: []extism.Wasm{
+				extism.WasmData{Data: wasmBytes},
+			},
+		}
+		plugin, err := extism.NewPlugin(context.Background(), manifest, extism.PluginConfig{}, []extism.HostFunction{})
+		if err != nil {
+			log.Fatalln("invalid WASM module:", err.Error())
+		}
+
+		// Check if the filter function exists
+		if !plugin.FunctionExists("filter") {
+			plugin.Close(context.Background())
+			log.Fatalln("WASM module must export a 'filter' function")
+		}
+
+		plugin.Close(context.Background())
+		fmt.Println("WASM module validated successfully")
+
+		// Store in database
+		_, err = db.Exec(`INSERT INTO scripts (from_did, slot, script_type, wasm_bytecode, script) VALUES (?, ?, 'wasm', ?, '') ON CONFLICT DO UPDATE SET script_type = 'wasm', wasm_bytecode = ?, script = ''`, did, slot, wasmBytes, wasmBytes)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("WASM plugin set successfully for", did, "slot", slot)
+
 	default:
 		log.Fatalln("unknown command:", arg1)
 	}
