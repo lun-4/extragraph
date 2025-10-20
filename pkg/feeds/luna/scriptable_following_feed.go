@@ -921,7 +921,7 @@ func (ff *ScriptableFollowingFeed) processScriptsForUser(
 			var newRuntime Runtime
 			var err error
 
-			slog.Debug("compiling new runtime", slog.String("type", script.Type))
+			slog.Info("compiling new runtime", slog.String("type", script.Type), slog.String("user", fromDid))
 			if script.Type == "wasm" {
 				newRuntime, err = CompileExtism(ctx, script)
 			} else {
