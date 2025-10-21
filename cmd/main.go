@@ -16,7 +16,6 @@ import (
 	ginendpoints "github.com/ericvolp12/go-bsky-feed-generator/pkg/gin"
 
 	lunafeeds "github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds/luna"
-	staticfeed "github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds/static"
 	ginprometheus "github.com/ericvolp12/go-gin-prometheus"
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -98,19 +97,6 @@ func main() {
 	// Here we can add feeds to the Feed Router instance
 	// Feeds conform to the Feed interface, which is defined in
 	// pkg/feedrouter/feedrouter.go
-
-	// For demonstration purposes, we'll use a static feed generator
-	// that will always return the same feed skeleton (one post)
-	staticFeed, staticFeedAliases, err := staticfeed.NewStaticFeed(
-		ctx,
-		feedActorDID,
-		"static",
-		// This static post is the conversation that sparked this demo repo
-		[]string{"at://did:plc:q6gjnaw2blty4crticxkmujt/app.bsky.feed.post/3jx7msc4ive26"},
-	)
-
-	// Add the static feed to the feed generator
-	feedRouter.AddFeed(staticFeedAliases, staticFeed)
 
 	lunaFeeds, _ := lunafeeds.ConfigureLunaFeeds(ctx)
 	for _, lunaFeed := range lunaFeeds {
