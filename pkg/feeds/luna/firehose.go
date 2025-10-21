@@ -67,7 +67,7 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 			DatabasePath:           databasePath,
 			relayAddress:           relayAddress,
 			appviewUrl:             os.Getenv("APPVIEW_URL"),
-			runtimes:               make(map[uint64]ScriptRuntime),
+			runtimes:               make(map[uint64]Runtime),
 			reportChannel:          make(chan int, 1000),
 			restartFirehoseChannel: make(chan bool, 1),
 		})

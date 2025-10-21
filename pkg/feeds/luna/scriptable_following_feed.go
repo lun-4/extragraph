@@ -38,6 +38,8 @@ import (
 	"github.com/arnodel/golua/lib/utf8lib"
 	rt "github.com/arnodel/golua/runtime"
 
+	extism "github.com/extism/go-sdk"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -89,10 +91,16 @@ type ScriptableFollowingFeed struct {
 	db                     *sql.DB
 	relayAddress           string
 	appviewUrl             string
-	runtimes               map[uint64]ScriptRuntime
+	runtimes               map[uint64]Runtime
 	reportChannel          chan int
 	restartFirehoseChannel chan bool
 	syncCursor             LockedInt
+}
+
+// Runtime is a common interface for both Lua and WASM script runtimes
+type Runtime interface {
+	Hash() uint64
+	Cleanup()
 }
 
 type ScriptRuntime struct {
@@ -104,7 +112,12 @@ type ScriptRuntime struct {
 	cleanups   []func()
 }
 
-func Compile(script Script) (ScriptRuntime, error) {
+type ExtismRuntime struct {
+	hash   uint64
+	plugin *extism.Plugin
+}
+
+func Compile(script Script) (*ScriptRuntime, error) {
 	sr := ScriptRuntime{hash: script.Hash(), cleanups: make([]func(), 0)}
 	sr.rt = rt.New(os.Stdout)
 	base.Load(sr.rt)
@@ -115,16 +128,20 @@ func Compile(script Script) (ScriptRuntime, error) {
 	sr.cleanups = append(sr.cleanups, utf8lib.LibLoader.Run(sr.rt))
 	chunk, err := sr.rt.CompileAndLoadLuaChunk("test", []byte(script.Text), rt.TableValue(sr.rt.GlobalEnv()))
 	if err != nil {
-		return ScriptRuntime{}, err
+		return nil, err
 	}
 	sr.chunk = chunk
 	scriptSpec, err := rt.Call1(sr.rt.MainThread(), rt.FunctionValue(chunk))
 	if err != nil {
-		return ScriptRuntime{}, err
+		return nil, err
 	}
 	sr.scriptSpec = scriptSpec
 	sr.filterFunc = scriptSpec.AsTable().Get(rt.StringValue("filter"))
-	return sr, nil
+	return &sr, nil
+}
+
+func (sr *ScriptRuntime) Hash() uint64 {
+	return sr.hash
 }
 
 func (sr *ScriptRuntime) Cleanup() {
@@ -142,6 +159,48 @@ func (sr *ScriptRuntime) Cleanup() {
 	sr.rt = nil
 	sr.chunk = nil
 	sr.cleanups = nil // Clear the cleanup slice
+}
+
+func CompileExtism(ctx context.Context, script Script) (*ExtismRuntime, error) {
+	if script.Type != "wasm" {
+		return nil, fmt.Errorf("script type must be 'wasm', got '%s'", script.Type)
+	}
+
+	manifest := extism.Manifest{
+		Wasm: []extism.Wasm{
+			extism.WasmData{Data: script.WasmBytecode},
+		},
+		Memory: &extism.ManifestMemory{
+			MaxPages: 32, // 32 pages = 2MB (WASM modules typically need ~16 pages minimum)
+		},
+		Timeout: 300, // 300 milliseconds
+	}
+
+	config := extism.PluginConfig{
+		EnableWasi: false, // Disable WASI for security
+	}
+
+	plugin, err := extism.NewPlugin(ctx, manifest, config, []extism.HostFunction{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Extism plugin: %w", err)
+	}
+
+	return &ExtismRuntime{
+		hash:   script.Hash(),
+		plugin: plugin,
+	}, nil
+}
+
+func (er *ExtismRuntime) Hash() uint64 {
+	return er.hash
+}
+
+func (er *ExtismRuntime) Cleanup() {
+	if er.plugin != nil {
+		// Close with background context since we're just cleaning up
+		er.plugin.Close(context.Background())
+		er.plugin = nil
+	}
 }
 
 func (ff *ScriptableFollowingFeed) Describe(ctx context.Context) ([]appbsky.FeedDescribeFeedGenerator_Feed, error) {
@@ -284,7 +343,9 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 	CREATE TABLE IF NOT EXISTS scripts (
 		from_did text primary key,
 		slot int,
-		script text
+		script text,
+		script_type text DEFAULT 'lua',
+		wasm_bytecode blob
 	) STRICT;
 
 	CREATE TABLE IF NOT EXISTS posts (
@@ -474,13 +535,19 @@ func (ff *ScriptableFollowingFeed) scrapeFollowers() {
 }
 
 type Script struct {
-	Slot int64
-	Text string
+	Slot         int64
+	Text         string
+	Type         string // "lua" or "wasm"
+	WasmBytecode []byte
 }
 
 func (s Script) Hash() uint64 {
 	h := fnv.New64a()
-	h.Write([]byte(s.Text))
+	if s.Type == "wasm" {
+		h.Write(s.WasmBytecode)
+	} else {
+		h.Write([]byte(s.Text))
+	}
 	return h.Sum64()
 }
 
@@ -702,20 +769,91 @@ func recToTable(anyV any) rt.Value {
 	}
 }
 
+// executeWasmFilter executes a WASM filter plugin with the given context
+func (ff *ScriptableFollowingFeed) executeWasmFilter(
+	ctx context.Context,
+	runtime *ExtismRuntime,
+	recordAuthorDid string,
+	recordType string,
+	record map[string]any,
+	followsMap map[string]int,
+	followedMap map[string]int,
+) (bool, error) {
+	slog.Debug("executeWasmFilter START")
+
+	// Build context map for JSON serialization
+	contextMap := make(map[string]any)
+	contextMap["author_did"] = recordAuthorDid
+
+	// Use the native Go record directly - no conversion needed!
+	if recordType == "post" {
+		contextMap["post"] = record
+		contextMap["repost"] = nil
+	} else {
+		contextMap["post"] = nil
+		contextMap["repost"] = record
+	}
+
+	// Use native Go maps directly - no conversion needed!
+	slog.Debug("using follows map")
+	contextMap["follows"] = followsMap
+	slog.Debug("follows set")
+
+	slog.Debug("using followed map")
+	contextMap["followed"] = followedMap
+	slog.Debug("followed set")
+
+	// Serialize to JSON
+	slog.Debug("marshaling to JSON")
+	inputJSON, err := json.Marshal(contextMap)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal context: %w", err)
+	}
+	slog.Debug("JSON marshaled", slog.Int("bytes", len(inputJSON)))
+
+	// Call the filter function in the WASM plugin
+	slog.Debug("calling WASM plugin")
+	exitCode, resultBytes, err := runtime.plugin.Call("filter", inputJSON)
+	slog.Debug("WASM plugin returned", slog.Int("exitCode", int(exitCode)), slog.Any("err", err))
+	if err != nil {
+		return false, fmt.Errorf("failed to call filter function: %w", err)
+	}
+
+	if exitCode != 0 {
+		return false, fmt.Errorf("filter function returned non-zero exit code: %d", exitCode)
+	}
+
+	// Parse the result (expecting a boolean JSON value)
+	slog.Debug("unmarshaling result")
+	var result bool
+	err = json.Unmarshal(resultBytes, &result)
+	if err != nil {
+		return false, fmt.Errorf("failed to unmarshal filter result: %w", err)
+	}
+
+	slog.Debug("executeWasmFilter DONE", slog.Bool("result", result))
+	return result, nil
+}
+
 func (ff *ScriptableFollowingFeed) processScriptsForUser(
+	ctx context.Context,
 	fromDid string, recordAuthorDid string,
-	atPath string, recordType string, recAsTable rt.Value) (bool, []uint64, error) {
+	atPath string, recordType string, record map[string]any, recAsTable rt.Value) (bool, []uint64, error) {
+	slog.Debug("processScriptsForUser START", slog.String("from_did", fromDid))
 	var usedRuntimes []uint64
 	var hadAnyAllowed bool
 
-	scriptRows, err := ff.db.Query(`SELECT slot, script FROM scripts WHERE from_did = $1`, fromDid)
+	scriptRows, err := ff.db.Query(`SELECT slot, script, script_type, wasm_bytecode FROM scripts WHERE from_did = $1`, fromDid)
+	slog.Debug("script query done", slog.Any("err", err))
 	if err != nil {
 		slog.Error("error querying script rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
 		return false, nil, err
 	}
 	defer scriptRows.Close()
 
-	followsTable := rt.NewTable()
+	slog.Debug("querying follows")
+	// Use Go map instead of Lua table - will convert to Lua table only when needed
+	followsMap := make(map[string]int)
 	followsRows, err := ff.db.Query("SELECT to_did FROM follow_relationships WHERE from_did = ?", fromDid)
 	if err != nil {
 		slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
@@ -730,10 +868,13 @@ func (ff *ScriptableFollowingFeed) processScriptsForUser(
 			slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
-		followsTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
+		followsMap[followingDid] = 1
 	}
+	slog.Debug("follows done")
 
-	followedTable := rt.NewTable()
+	slog.Debug("querying followed")
+	// Use Go map instead of Lua table - will convert to Lua table only when needed
+	followedMap := make(map[string]int)
 	followedRows, err := ff.db.Query("SELECT from_did FROM follow_relationships WHERE to_did = ?", fromDid)
 	if err != nil {
 		slog.Error("error querying follows rows from did", slog.Any("err", err), slog.String("from_did", fromDid))
@@ -748,57 +889,111 @@ func (ff *ScriptableFollowingFeed) processScriptsForUser(
 			slog.Error("error querying follow row from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
-		followedTable.Set(rt.StringValue(followingDid), rt.IntValue(1))
+		followedMap[followingDid] = 1
 	}
+	slog.Debug("followed done")
 
+	slog.Debug("starting script loop")
 	for scriptRows.Next() {
+		slog.Debug("processing script row")
 		var script Script
-		err = scriptRows.Scan(&script.Slot, &script.Text)
+		var scriptType sql.NullString
+		var wasmBytecode []byte
+		err = scriptRows.Scan(&script.Slot, &script.Text, &scriptType, &wasmBytecode)
 		if err != nil {
 			slog.Error("error querying script row from did", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
+		slog.Debug("scanned script row", slog.Int64("slot", script.Slot))
+
+		// Set script type (default to "lua" for backwards compatibility)
+		if scriptType.Valid {
+			script.Type = scriptType.String
+		} else {
+			script.Type = "lua"
+		}
+		script.WasmBytecode = wasmBytecode
+		slog.Debug("script type set", slog.String("type", script.Type))
 
 		runtime, found := ff.runtimes[script.Hash()]
+		slog.Debug("runtime lookup", slog.Bool("found", found), slog.String("type", script.Type))
 		if !found {
-			newRuntime, err := Compile(script)
+			var newRuntime Runtime
+			var err error
+
+			slog.Info("compiling new runtime", slog.String("type", script.Type), slog.String("user", fromDid))
+			if script.Type == "wasm" {
+				newRuntime, err = CompileExtism(ctx, script)
+			} else {
+				newRuntime, err = Compile(script)
+			}
+			slog.Debug("compilation done", slog.Any("err", err))
+
 			if err != nil {
-				slog.Error("error compiling script", slog.Any("err", err), slog.String("from_did", fromDid), slog.Int64("slot", script.Slot))
+				slog.Error("error compiling script", slog.Any("err", err), slog.String("from_did", fromDid), slog.Int64("slot", script.Slot), slog.String("type", script.Type))
 				continue
 			}
 			ff.runtimes[script.Hash()] = newRuntime
 			runtime = newRuntime
 		}
-		usedRuntimes = append(usedRuntimes, runtime.hash)
+		usedRuntimes = append(usedRuntimes, runtime.Hash())
 
-		// Build context table based on record type
-		t := rt.NewTable()
-		t.Set(rt.StringValue("author_did"), rt.StringValue(recordAuthorDid))
-		if recordType == "post" {
-			t.Set(rt.StringValue("post"), recAsTable)
-			t.Set(rt.StringValue("repost"), rt.NilValue)
-		} else {
-			t.Set(rt.StringValue("post"), rt.NilValue)
-			t.Set(rt.StringValue("repost"), recAsTable)
-		}
-		// TODO optimize if a script doesn't request the follower/follow lists (e.g word scripts)
-		t.Set(rt.StringValue("follows"), rt.TableValue(followsTable))
-		t.Set(rt.StringValue("followed"), rt.TableValue(followedTable))
-		runtime.rt.PushContext(rt.RuntimeContextDef{
-			HardLimits: rt.RuntimeResources{
-				Memory: 100000,
-				Cpu:    1000000,
-				Millis: 300,
-			},
-			RequiredFlags: rt.ComplyIoSafe | rt.ComplyCpuSafe | rt.ComplyMemSafe | rt.ComplyTimeSafe,
-		})
-		allowed, err := rt.Call1(runtime.rt.MainThread(), runtime.filterFunc, rt.TableValue(t))
-		_ = runtime.rt.PopContext()
-		if err != nil {
-			slog.Error("error calling script", slog.Any("err", err), slog.String("from_did", fromDid))
+		// Execute filter based on runtime type
+		var isAllowed bool
+
+		slog.Debug("executing filter", slog.String("type", script.Type))
+		switch r := runtime.(type) {
+		case *ScriptRuntime:
+			// Lua execution path - convert Go maps to Lua tables
+			followsTable := rt.NewTable()
+			for did := range followsMap {
+				followsTable.Set(rt.StringValue(did), rt.IntValue(1))
+			}
+			followedTable := rt.NewTable()
+			for did := range followedMap {
+				followedTable.Set(rt.StringValue(did), rt.IntValue(1))
+			}
+
+			t := rt.NewTable()
+			t.Set(rt.StringValue("author_did"), rt.StringValue(recordAuthorDid))
+			if recordType == "post" {
+				t.Set(rt.StringValue("post"), recAsTable)
+				t.Set(rt.StringValue("repost"), rt.NilValue)
+			} else {
+				t.Set(rt.StringValue("post"), rt.NilValue)
+				t.Set(rt.StringValue("repost"), recAsTable)
+			}
+			t.Set(rt.StringValue("follows"), rt.TableValue(followsTable))
+			t.Set(rt.StringValue("followed"), rt.TableValue(followedTable))
+
+			r.rt.PushContext(rt.RuntimeContextDef{
+				HardLimits: rt.RuntimeResources{
+					Memory: 100000,
+					Cpu:    1000000,
+					Millis: 300,
+				},
+				RequiredFlags: rt.ComplyIoSafe | rt.ComplyCpuSafe | rt.ComplyMemSafe | rt.ComplyTimeSafe,
+			})
+			allowed, err := rt.Call1(r.rt.MainThread(), r.filterFunc, rt.TableValue(t))
+			_ = r.rt.PopContext()
+			if err != nil {
+				slog.Error("error calling lua script", slog.Any("err", err), slog.String("from_did", fromDid))
+				continue
+			}
+			isAllowed = allowed.AsBool()
+
+		case *ExtismRuntime:
+			// WASM execution path - use native Go maps directly
+			isAllowed, err = ff.executeWasmFilter(ctx, r, recordAuthorDid, recordType, record, followsMap, followedMap)
+			if err != nil {
+				slog.Error("error calling wasm script", slog.Any("err", err), slog.String("from_did", fromDid))
+				continue
+			}
+
+		default:
+			slog.Error("unknown runtime type", slog.String("from_did", fromDid))
 			continue
 		}
-		isAllowed := allowed.AsBool()
 		if isAllowed {
 			hadAnyAllowed = true
 			_, err = ff.db.Exec(`INSERT INTO allowed_posts (from_did, slot, at_path) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, fromDid, script.Slot, atPath)
@@ -814,6 +1009,8 @@ func (ff *ScriptableFollowingFeed) processScriptsForUser(
 }
 
 func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record map[string]any, atPath string, recordType string) (bool, error) {
+	slog.Debug("handleRecord called", slog.String("type", recordType), slog.String("author", recordAuthorDid))
+
 	// we need to run every script for every user we know, and add to posts table for each script that allowed the record
 	rows, err := ff.db.Query("SELECT from_did FROM scrape_state WHERE state = 'ready'")
 	if err != nil {
@@ -824,7 +1021,10 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 
 	allUsedRuntimes := make([]uint64, 0)
 	var hadAnyAllowed bool
+
+	slog.Debug("converting record to table")
 	recAsTable := recToTable(record)
+	slog.Debug("record converted to table")
 
 	for rows.Next() {
 		var fromDid string
@@ -834,13 +1034,16 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 			continue
 		}
 
-		userHadAllowed, usedRuntimes, err := ff.processScriptsForUser(fromDid, recordAuthorDid, atPath, recordType, recAsTable)
+		slog.Debug("processing scripts for user", slog.String("from_did", fromDid))
+		userHadAllowed, usedRuntimes, err := ff.processScriptsForUser(context.Background(), fromDid, recordAuthorDid, atPath, recordType, record, recAsTable)
+		slog.Debug("processScriptsForUser returned", slog.String("from_did", fromDid), slog.Bool("allowed", userHadAllowed), slog.Any("err", err))
 		if err != nil {
 			slog.Error("error processing scripts for user", slog.Any("err", err), slog.String("from_did", fromDid))
 			continue
 		}
 
 		if userHadAllowed {
+			slog.Info("allowed", slog.String("from_did", fromDid), slog.String("author_did", recordAuthorDid))
 			hadAnyAllowed = true
 		}
 		allUsedRuntimes = append(allUsedRuntimes, usedRuntimes...)
@@ -849,7 +1052,7 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 	for k, runtime := range ff.runtimes {
 		if !slices.Contains(allUsedRuntimes, k) {
 			slog.Warn("runtime not used", slog.Uint64("hash", k))
-			delete(ff.runtimes, runtime.hash)
+			delete(ff.runtimes, k)
 			runtime.Cleanup()
 		}
 	}
@@ -858,9 +1061,11 @@ func (ff *ScriptableFollowingFeed) handleRecord(recordAuthorDid string, record m
 }
 
 func (ff *ScriptableFollowingFeed) handlePost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
-	return ff.handleRecord(recordAuthorDid, record, atPath, "post")
+	result, err := ff.handleRecord(recordAuthorDid, record, atPath, "post")
+	return result, err
 }
 
 func (ff *ScriptableFollowingFeed) handleRepost(recordAuthorDid string, record map[string]any, atPath string) (bool, error) {
-	return ff.handleRecord(recordAuthorDid, record, atPath, "repost")
+	result, err := ff.handleRecord(recordAuthorDid, record, atPath, "repost")
+	return result, err
 }
