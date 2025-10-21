@@ -3,7 +3,6 @@ package feeds
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"sync"
 
@@ -23,7 +22,8 @@ func (b *Broadcaster) Subscribe() chan *models.Event {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	ch := make(chan *models.Event, 10)
+	// Larger buffer to handle firehose volume (can be 1000+ events/sec)
+	ch := make(chan *models.Event, 10000)
 	b.listeners = append(b.listeners, ch)
 	return ch
 }
@@ -56,17 +56,16 @@ func NewJetstreamClient() *JetstreamClient {
 
 	// Handler function that broadcasts events
 	handleEvent := func(ctx context.Context, evt *models.Event) error {
-		// Log event details for debugging
-		if evt.Commit != nil {
+		// Only broadcast events we care about to reduce load
+		if evt.Kind == "commit" && evt.Commit != nil {
 			slog.Debug("jetstream event",
 				"did", evt.Did,
 				"kind", evt.Kind,
 				"operation", evt.Commit.Operation,
 				"collection", evt.Commit.Collection,
 			)
+			broadcaster.Broadcast(evt)
 		}
-
-		broadcaster.Broadcast(evt)
 		return nil
 	}
 
@@ -74,6 +73,7 @@ func NewJetstreamClient() *JetstreamClient {
 	scheduler := sequential.NewScheduler("jetstream", slog.Default(), handleEvent)
 
 	config := client.DefaultClientConfig()
+	config.WantedCollections = []string{"app.bsky.feed.post", "app.bsky.feed.repost", "app.bsky.graph.follow"}
 	config.WebsocketURL = "wss://jetstream1.us-east.bsky.network/subscribe"
 
 	jetstreamClient, err := client.NewClient(config, slog.Default(), scheduler)

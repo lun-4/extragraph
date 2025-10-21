@@ -22,6 +22,7 @@ import (
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/events/schedulers/sequential"
 	"github.com/bluesky-social/indigo/repo"
+	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds"
 	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feedrouter"
 	"github.com/gorilla/websocket"
 	"github.com/samber/lo"
@@ -35,7 +36,7 @@ type DynamicFeed interface {
 	GetFeedNames() []string
 }
 
-func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
+func ConfigureLunaFeeds(ctx context.Context, jetstreamClient *feeds.JetstreamClient) ([]DynamicFeed, error) {
 	relayAddress := os.Getenv("RELAY_WEBSOCKET_ADDRESS")
 	if relayAddress == "" {
 		panic("RELAY_WEBSOCKET_ADDRESS is required")
@@ -70,6 +71,7 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 			runtimes:               make(map[uint64]Runtime),
 			reportChannel:          make(chan int, 1000),
 			restartFirehoseChannel: make(chan bool, 1),
+			jetstreamClient:        jetstreamClient,
 		})
 	} else {
 		slog.Warn("scriptable following feed is disabled, skipping")

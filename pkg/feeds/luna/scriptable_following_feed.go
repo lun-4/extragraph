@@ -1,7 +1,6 @@
 package luna
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -21,14 +20,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bluesky-social/indigo/api/atproto"
 	appbsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/atdata"
-	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/events/schedulers/sequential"
-	"github.com/bluesky-social/indigo/repo"
-	"github.com/gorilla/websocket"
+	"github.com/bluesky-social/jetstream/pkg/models"
 	"github.com/samber/lo"
+
+	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds"
 
 	"github.com/arnodel/golua/lib/base"
 	"github.com/arnodel/golua/lib/mathlib"
@@ -95,6 +92,7 @@ type ScriptableFollowingFeed struct {
 	reportChannel          chan int
 	restartFirehoseChannel chan bool
 	syncCursor             LockedInt
+	jetstreamClient        *feeds.JetstreamClient
 }
 
 // Runtime is a common interface for both Lua and WASM script runtimes
@@ -376,38 +374,160 @@ func (ff *ScriptableFollowingFeed) Spawn(ctx context.Context) {
 }
 
 func (ff *ScriptableFollowingFeed) main(ctx context.Context) {
-	errorChannel := make(chan error, 1)
 	defer ff.db.Close()
+
+	if ff.jetstreamClient == nil {
+		slog.Error("jetstream client is nil, cannot start scriptable feed")
+		return
+	}
+
+	// Subscribe to jetstream events
+	eventsChan := ff.jetstreamClient.Subscribe()
+	slog.Info("scriptable feed subscribed to jetstream")
+
 	for {
-		// Create a cancellable context for this firehose consumer instance
-		consumerCtx, cancelConsumer := context.WithCancel(ctx)
-		doneChannel := make(chan bool, 1)
-
-		go func() {
-			ff.firehoseConsumer(consumerCtx, errorChannel)
-			doneChannel <- true
-		}()
-
 		select {
-		case err := <-errorChannel:
-			slog.Error("error in firehose consumer, restarting", slog.Any("err", err))
+		case <-ctx.Done():
+			slog.Info("scriptable feed shutting down")
+			return
 		case <-ff.restartFirehoseChannel:
-			slog.Error("restart requested")
+			slog.Info("restart requested, but using shared jetstream client")
+		case evt := <-eventsChan:
+			if evt == nil {
+				continue
+			}
+			ff.handleJetstreamEvent(ctx, evt)
 		}
+	}
+}
 
-		// Cancel the context to signal shutdown
-		cancelConsumer()
+// handleJetstreamEvent processes a single Jetstream event
+func (ff *ScriptableFollowingFeed) handleJetstreamEvent(ctx context.Context, evt *models.Event) {
+	if evt.Kind != "commit" || evt.Commit == nil {
+		return
+	}
 
-		// Wait for the goroutine to actually exit (with timeout)
-		select {
-		case <-doneChannel:
-			slog.Info("firehose consumer exited cleanly")
-		case <-time.After(10 * time.Second):
-			slog.Warn("firehose consumer didn't exit within timeout")
-		}
+	commit := evt.Commit
+	userDid := evt.Did
 
-		slog.Info("sleeping for 3 seconds before restart")
-		time.Sleep(3 * time.Second)
+	slog.Debug("jetstream event",
+		"did", userDid,
+		"operation", commit.Operation,
+		"collection", commit.Collection,
+		"rkey", commit.RKey,
+	)
+
+	switch commit.Collection {
+	case "app.bsky.graph.follow":
+		ff.handleFollow(userDid, commit)
+	case "app.bsky.feed.post":
+		ff.handlePostFromJetstream(ctx, userDid, commit)
+	default:
+		slog.Debug("unhandled collection", "collection", commit.Collection)
+	}
+}
+
+// handleFollow processes a follow event from Jetstream
+func (ff *ScriptableFollowingFeed) handleFollow(userDid string, commit *models.Commit) {
+	// Skip delete operations
+	if commit.Operation == "delete" {
+		return
+	}
+
+	// only follows from users we scraped shall be synced
+	var state string
+	row := ff.db.QueryRow("SELECT state FROM scrape_state WHERE from_did = ?", userDid)
+	err := row.Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		slog.Debug("no scrape state found for user, ignoring", "user_did", userDid)
+		return
+	}
+	if state != "ready" {
+		return
+	}
+
+	// Parse the record JSON (skip if empty)
+	if len(commit.Record) == 0 {
+		slog.Debug("empty record for follow", "did", userDid)
+		return
+	}
+
+	var rec map[string]interface{}
+	err = json.Unmarshal(commit.Record, &rec)
+	if err != nil {
+		slog.Debug("error unmarshaling follow record", "err", err, "did", userDid)
+		return
+	}
+
+	subject, ok := rec["subject"].(string)
+	if !ok {
+		slog.Debug("follow record missing subject")
+		return
+	}
+
+	_, err = ff.db.Exec(`INSERT INTO follow_relationships (from_did, to_did) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userDid, subject)
+	if err != nil {
+		slog.Error("error inserting following", "err", err)
+	} else {
+		slog.Debug("followed", "from", userDid, "to", subject)
+	}
+}
+
+// handlePostFromJetstream processes a post event from Jetstream
+func (ff *ScriptableFollowingFeed) handlePostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	// Skip delete/update operations - we only care about creates
+	if commit.Operation != "create" {
+		return
+	}
+
+	// Skip if record is empty
+	if len(commit.Record) == 0 {
+		slog.Debug("empty record for post", "did", userDid, "rkey", commit.RKey)
+		return
+	}
+
+	// Parse the record JSON
+	var rec map[string]interface{}
+	err := json.Unmarshal(commit.Record, &rec)
+	if err != nil {
+		slog.Debug("error unmarshaling post record", "err", err, "did", userDid, "rkey", commit.RKey)
+		return
+	}
+
+	ff.reportChannel <- INCOMING_POST
+
+	atPath := fmt.Sprintf("at://%s/app.bsky.feed.post/%s", userDid, commit.RKey)
+	ok, err := ff.handlePost(userDid, rec, atPath)
+	if err != nil {
+		slog.Error("error handling post", "path", atPath, "err", err)
+		return
+	}
+
+	ff.reportChannel <- PROCESSED_POST
+	if !ok {
+		return
+	}
+	ff.reportChannel <- ALLOWED_POST
+
+	// Get max counter and insert post
+	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
+	var maybeCurrentMaxIndex *uint64
+	err = row.Scan(&maybeCurrentMaxIndex)
+	if err != nil {
+		slog.Error("error getting max index", "err", err)
+		return
+	}
+
+	var newIndex uint64
+	if maybeCurrentMaxIndex != nil {
+		newIndex = *maybeCurrentMaxIndex + 1
+	}
+
+	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
+	if err != nil {
+		slog.Error("error inserting post", "err", err)
+	} else {
+		slog.Debug("post created", "at", atPath)
 	}
 }
 
@@ -551,179 +671,6 @@ func (s Script) Hash() uint64 {
 	return h.Sum64()
 }
 
-func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorChannel chan error) {
-	var uri string
-	cursor := ff.syncCursor.LockAndGet()
-	if cursor != 0 {
-		slog.Info("resuming from cursor", slog.Uint64("cursor", uint64(cursor)))
-		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", ff.relayAddress, cursor)
-	} else {
-		// start from now, dont care about resuming across restarts, only really across crashes
-		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos", ff.relayAddress)
-	}
-	con, _, err := websocket.DefaultDialer.Dial(uri, http.Header{})
-	if err != nil {
-		slog.Error("error dialing websocket", slog.Any("err", err))
-		errorChannel <- fmt.Errorf("error dialing websocket: %w", err)
-		return
-	}
-	defer con.Close()
-	rsc := &events.RepoStreamCallbacks{
-		RepoCommit: func(evt *atproto.SyncSubscribeRepos_Commit) error {
-			ff.syncCursor.LockAndSet(uint(evt.Seq))
-
-			rr, err := repo.ReadRepoFromCar(ctx, bytes.NewReader(evt.Blocks))
-			if err != nil {
-				return nil
-			}
-			userDid := evt.Repo
-
-			for _, op := range evt.Ops {
-				slog.Debug("incoming event", slog.String("path", op.Path), slog.Any("cid", op.Cid), slog.String("action", op.Action), slog.String("repo", evt.Repo))
-				rcid, recBytes, err := rr.GetRecordBytes(ctx, op.Path)
-				if err != nil {
-					continue
-				}
-				slog.Debug("event", slog.String("rcid", rcid.String()))
-
-				recordType, recordData, err := atdata.ExtractTypeCBORReader(bytes.NewReader(*recBytes))
-				if err != nil {
-					continue
-				}
-				slog.Debug("record", slog.String("record", recordType))
-
-				switch recordType {
-				case "app.bsky.graph.follow":
-					// only follows from users we scraped shall be synced
-					var state string
-					row := ff.db.QueryRow("SELECT state FROM scrape_state WHERE from_did = ?", userDid)
-					err = row.Scan(&state)
-					if errors.Is(err, sql.ErrNoRows) {
-						slog.Debug("no scrape state found for user, ignoring", slog.String("user_did", userDid))
-						continue
-					}
-					if state != "ready" {
-						continue
-					}
-
-					rec, err := atdata.UnmarshalCBOR(recordData)
-					if err != nil {
-						continue
-					}
-
-					recJSON, err := json.Marshal(rec)
-					if err != nil {
-						continue
-					}
-
-					subject, ok := rec["subject"].(string)
-					slog.Debug("follow", slog.String("text", string(recJSON)))
-					if ok {
-						_, err := ff.db.Exec(`INSERT INTO follow_relationships (from_did, to_did) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userDid, subject)
-						if err != nil {
-							slog.Error("error inserting following", slog.Any("err", err))
-						} else {
-							slog.Debug("followed", slog.String("from", userDid), slog.String("to", subject))
-						}
-					}
-				case "app.bsky.feed.post":
-					rec, err := atdata.UnmarshalCBOR(recordData)
-					if err != nil {
-						continue
-					}
-					ff.reportChannel <- INCOMING_POST
-
-					atPath := fmt.Sprintf("at://%s/%s", userDid, op.Path)
-					ok, err := ff.handlePost(userDid, rec, atPath)
-					if err != nil {
-						slog.Error("error handling post", slog.String("path", atPath), slog.Any("err", err))
-						continue
-					}
-					// if none of the scripts allowed the post, we don't need to store it
-					ff.reportChannel <- PROCESSED_POST
-					if !ok {
-						continue
-					}
-					ff.reportChannel <- ALLOWED_POST
-
-					row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
-					var maybeCurrentMaxIndex *uint64
-					err = row.Scan(&maybeCurrentMaxIndex)
-					if err != nil {
-						slog.Error("error getting max index", slog.Any("err", err))
-						continue
-					}
-
-					var newIndex uint64
-					if maybeCurrentMaxIndex != nil {
-						newIndex = *maybeCurrentMaxIndex + 1
-					}
-					_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
-					if err != nil {
-						slog.Error("error inserting post", slog.Any("err", err))
-					} else {
-						slog.Debug("post created", slog.String("at", atPath))
-					}
-				case "app.bsky.feed.repost":
-					rec, err := atdata.UnmarshalCBOR(recordData)
-					if err != nil {
-						continue
-					}
-					ff.reportChannel <- INCOMING_POST
-
-					atPath := fmt.Sprintf("at://%s/%s", userDid, op.Path)
-					ok, err := ff.handleRepost(userDid, rec, atPath)
-					if err != nil {
-						slog.Error("error handling repost", slog.String("path", atPath), slog.Any("err", err))
-						continue
-					}
-					// if none of the scripts allowed the repost, we don't need to store it
-					ff.reportChannel <- PROCESSED_POST
-					if !ok {
-						continue
-					}
-					ff.reportChannel <- ALLOWED_POST
-
-					row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
-					var maybeCurrentMaxIndex *uint64
-					err = row.Scan(&maybeCurrentMaxIndex)
-					if err != nil {
-						slog.Error("error getting max index", slog.Any("err", err))
-						continue
-					}
-
-					var newIndex uint64
-					if maybeCurrentMaxIndex != nil {
-						newIndex = *maybeCurrentMaxIndex + 1
-					}
-					_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
-					if err != nil {
-						slog.Error("error inserting post", slog.Any("err", err))
-					} else {
-						slog.Debug("repost created", slog.String("at", atPath))
-					}
-				default:
-					slog.Debug("unknown record type, ignoring", slog.String("record", recordType))
-				}
-			}
-
-			return nil
-		},
-	}
-
-	sched := sequential.NewScheduler("scriptable_following_feed", rsc.EventHandler)
-	defer sched.Shutdown()
-
-	go func() {
-		err = events.HandleRepoStream(ctx, con, sched, slog.Default())
-		errorChannel <- err
-		slog.Warn("firehose consumer exiting", slog.Any("err", err))
-	}()
-
-	<-ctx.Done()
-	slog.Warn("firehose consumer exiting, context cancelled")
-}
-
 func recToTable(anyV any) rt.Value {
 	switch v := anyV.(type) {
 	case nil:
@@ -732,6 +679,8 @@ func recToTable(anyV any) rt.Value {
 		return rt.BoolValue(v)
 	case int64:
 		return rt.IntValue(v)
+	case float64:
+		return rt.FloatValue(v)
 	case string:
 		return rt.StringValue(v)
 	case []any:

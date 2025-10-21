@@ -99,7 +99,17 @@ func main() {
 	// Feeds conform to the Feed interface, which is defined in
 	// pkg/feedrouter/feedrouter.go
 
-	lunaFeeds, _ := lunafeeds.ConfigureLunaFeeds(ctx)
+	// Start Jetstream client before feeds so it's available
+	jetstreamClient := feeds.NewJetstreamClient()
+	go func() {
+		slog.Info("starting jetstream client")
+		err := jetstreamClient.Start(ctx)
+		if err != nil {
+			slog.Error("jetstream client error", slog.Any("err", err))
+		}
+	}()
+
+	lunaFeeds, _ := lunafeeds.ConfigureLunaFeeds(ctx, jetstreamClient)
 	for _, lunaFeed := range lunaFeeds {
 		lunaFeed.Spawn(ctx)
 		feedRouter.AddFeed(lunaFeed.GetFeedNames(), lunaFeed)
@@ -110,16 +120,6 @@ func main() {
 			fmt.Println("Added feed: ", k, dAt)
 		}
 	}
-
-	// Start Jetstream client
-	jetstreamClient := feeds.NewJetstreamClient()
-	go func() {
-		slog.Info("starting jetstream client")
-		err := jetstreamClient.Start(ctx)
-		if err != nil {
-			slog.Error("jetstream client error", slog.Any("err", err))
-		}
-	}()
 
 	// Create a gin router with default middleware for logging and recovery
 	router := gin.Default()
