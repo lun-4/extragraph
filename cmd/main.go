@@ -15,6 +15,7 @@ import (
 	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feedrouter"
 	ginendpoints "github.com/ericvolp12/go-bsky-feed-generator/pkg/gin"
 
+	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds"
 	lunafeeds "github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds/luna"
 	ginprometheus "github.com/ericvolp12/go-gin-prometheus"
 	"github.com/gin-gonic/gin"
@@ -109,6 +110,16 @@ func main() {
 			fmt.Println("Added feed: ", k, dAt)
 		}
 	}
+
+	// Start Jetstream client
+	jetstreamClient := feeds.NewJetstreamClient()
+	go func() {
+		slog.Info("starting jetstream client")
+		err := jetstreamClient.Start(ctx)
+		if err != nil {
+			slog.Error("jetstream client error", slog.Any("err", err))
+		}
+	}()
 
 	// Create a gin router with default middleware for logging and recovery
 	router := gin.Default()

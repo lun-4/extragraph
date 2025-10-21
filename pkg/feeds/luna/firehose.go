@@ -18,7 +18,7 @@ import (
 
 	"github.com/bluesky-social/indigo/api/atproto"
 	appbsky "github.com/bluesky-social/indigo/api/bsky"
-	"github.com/bluesky-social/indigo/atproto/data"
+	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/events/schedulers/sequential"
 	"github.com/bluesky-social/indigo/repo"
@@ -362,7 +362,7 @@ func (ff *FollowingFeed) firehoseConsumer(ctx context.Context) error {
 				}
 				slog.Debug("event", slog.String("rcid", rcid.String()))
 
-				recordType, recordData, err := data.ExtractTypeCBORReader(bytes.NewReader(*recBytes))
+				recordType, recordData, err := atdata.ExtractTypeCBORReader(bytes.NewReader(*recBytes))
 				if err != nil {
 					return nil
 				}
@@ -370,7 +370,7 @@ func (ff *FollowingFeed) firehoseConsumer(ctx context.Context) error {
 
 				switch recordType {
 				case "app.bsky.graph.follow":
-					rec, err := data.UnmarshalCBOR(recordData)
+					rec, err := atdata.UnmarshalCBOR(recordData)
 					if err != nil {
 						return nil
 					}
@@ -420,5 +420,5 @@ func (ff *FollowingFeed) firehoseConsumer(ctx context.Context) error {
 	}
 
 	sched := sequential.NewScheduler("following_feed", rsc.EventHandler)
-	return events.HandleRepoStream(ctx, con, sched)
+	return events.HandleRepoStream(ctx, con, sched, slog.Default())
 }

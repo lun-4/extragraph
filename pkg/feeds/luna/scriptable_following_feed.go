@@ -23,7 +23,7 @@ import (
 
 	"github.com/bluesky-social/indigo/api/atproto"
 	appbsky "github.com/bluesky-social/indigo/api/bsky"
-	"github.com/bluesky-social/indigo/atproto/data"
+	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/events/schedulers/sequential"
 	"github.com/bluesky-social/indigo/repo"
@@ -558,6 +558,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 		slog.Info("resuming from cursor", slog.Uint64("cursor", uint64(cursor)))
 		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", ff.relayAddress, cursor)
 	} else {
+		// start from now, dont care about resuming across restarts, only really across crashes
 		uri = fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos", ff.relayAddress)
 	}
 	con, _, err := websocket.DefaultDialer.Dial(uri, http.Header{})
@@ -585,7 +586,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 				}
 				slog.Debug("event", slog.String("rcid", rcid.String()))
 
-				recordType, recordData, err := data.ExtractTypeCBORReader(bytes.NewReader(*recBytes))
+				recordType, recordData, err := atdata.ExtractTypeCBORReader(bytes.NewReader(*recBytes))
 				if err != nil {
 					continue
 				}
@@ -605,7 +606,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 						continue
 					}
 
-					rec, err := data.UnmarshalCBOR(recordData)
+					rec, err := atdata.UnmarshalCBOR(recordData)
 					if err != nil {
 						continue
 					}
@@ -626,7 +627,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 						}
 					}
 				case "app.bsky.feed.post":
-					rec, err := data.UnmarshalCBOR(recordData)
+					rec, err := atdata.UnmarshalCBOR(recordData)
 					if err != nil {
 						continue
 					}
@@ -664,7 +665,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 						slog.Debug("post created", slog.String("at", atPath))
 					}
 				case "app.bsky.feed.repost":
-					rec, err := data.UnmarshalCBOR(recordData)
+					rec, err := atdata.UnmarshalCBOR(recordData)
 					if err != nil {
 						continue
 					}
@@ -714,7 +715,7 @@ func (ff *ScriptableFollowingFeed) firehoseConsumer(ctx context.Context, errorCh
 	defer sched.Shutdown()
 
 	go func() {
-		err = events.HandleRepoStream(ctx, con, sched)
+		err = events.HandleRepoStream(ctx, con, sched, slog.Default())
 		errorChannel <- err
 		slog.Warn("firehose consumer exiting", slog.Any("err", err))
 	}()
@@ -755,13 +756,13 @@ func recToTable(anyV any) rt.Value {
 			out.Set(k, v)
 		}
 		return rt.TableValue(out)
-	case data.Blob:
+	case atdata.Blob:
 		return recToTable(map[string]any{
 			"mimeType": v.MimeType,
 			"size":     v.Size,
 			"ref":      v.Ref,
 		})
-	case data.CIDLink:
+	case atdata.CIDLink:
 		return recToTable(v.String())
 	default:
 		slog.Warn("unknown value", slog.Any("v", anyV), slog.String("type", reflect.TypeOf(anyV).String()))
