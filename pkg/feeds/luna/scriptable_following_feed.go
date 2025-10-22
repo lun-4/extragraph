@@ -559,6 +559,8 @@ func (ff *ScriptableFollowingFeed) runReports() {
 			if counters.processed == 0 {
 				log.Printf("no events for %d amount of seconds", badIncomingCounter)
 				badIncomingCounter++
+			} else if counters.processed > 0 {
+				badIncomingCounter = 0
 			}
 			if badIncomingCounter > 20 {
 				log.Printf("assuming connection went to shit. we got %d seconds with zero events", badIncomingCounter)
