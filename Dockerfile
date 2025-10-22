@@ -1,4 +1,4 @@
-FROM golang:1.23-bookworm
+FROM golang:1.24-bookworm
 RUN apt update
 RUN apt install ca-certificates
 RUN update-ca-certificates -f
