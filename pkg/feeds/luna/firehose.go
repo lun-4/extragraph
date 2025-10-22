@@ -29,9 +29,9 @@ type DynamicFeed interface {
 }
 
 func ConfigureLunaFeeds(ctx context.Context, jetstreamClient *feeds.JetstreamClient) ([]DynamicFeed, error) {
-	relayAddress := os.Getenv("RELAY_WEBSOCKET_ADDRESS")
-	if relayAddress == "" {
-		panic("RELAY_WEBSOCKET_ADDRESS is required")
+	jetstreamAddress := os.Getenv("JETSTREAM_WEBSOCKET_ADDRESS")
+	if jetstreamAddress == "" {
+		panic("JETSTREAM_WEBSOCKET_ADDRESS is required")
 	}
 	appviewUrl := os.Getenv("APPVIEW_URL")
 	if appviewUrl == "" {
@@ -43,7 +43,6 @@ func ConfigureLunaFeeds(ctx context.Context, jetstreamClient *feeds.JetstreamCli
 			FeedActorDID:     os.Getenv("FOLLOWING_FEED_ACTOR_DID"),
 			FeedName:         os.Getenv("FOLLOWING_FEED_NAME"),
 			DiscoverFeedName: os.Getenv("DISCOVER_FEED_NAME"),
-			relayAddress:     relayAddress,
 			jetstreamClient:  jetstreamClient,
 		})
 	} else {
@@ -59,7 +58,6 @@ func ConfigureLunaFeeds(ctx context.Context, jetstreamClient *feeds.JetstreamCli
 			FeedActorDID:           os.Getenv("SCRIPTABLE_FOLLOWING_FEED_ACTOR_DID"),
 			FeedName:               os.Getenv("SCRIPTABLE_FOLLOWING_FEED_NAME"),
 			DatabasePath:           databasePath,
-			relayAddress:           relayAddress,
 			appviewUrl:             os.Getenv("APPVIEW_URL"),
 			runtimes:               make(map[uint64]Runtime),
 			reportChannel:          make(chan int, 1000),
@@ -81,7 +79,6 @@ type FollowingFeed struct {
 	FeedName         string
 	DiscoverFeedName string
 	db               *sql.DB
-	relayAddress     string
 	appviewUrl       string
 	jetstreamClient  *feeds.JetstreamClient
 }

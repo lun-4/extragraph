@@ -86,7 +86,6 @@ type ScriptableFollowingFeed struct {
 	FeedName               string
 	DatabasePath           string
 	db                     *sql.DB
-	relayAddress           string
 	appviewUrl             string
 	runtimes               map[uint64]Runtime
 	reportChannel          chan int

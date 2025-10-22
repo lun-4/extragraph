@@ -3,7 +3,9 @@ package feeds
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,7 +91,12 @@ func NewJetstreamClient() *JetstreamClient {
 
 	config := client.DefaultClientConfig()
 	config.WantedCollections = []string{"app.bsky.feed.post", "app.bsky.feed.repost", "app.bsky.graph.follow"}
-	config.WebsocketURL = "wss://jetstream1.us-east.bsky.network/subscribe"
+	jetstreamAddress := os.Getenv("JETSTREAM_WEBSOCKET_ADDRESS")
+	if jetstreamAddress == "" {
+		panic("JETSTREAM_WEBSOCKET_ADDRESS is required")
+	}
+
+	config.WebsocketURL = fmt.Sprintf("%s/subscribe", jetstreamAddress)
 
 	jetstreamClient, err := client.NewClient(config, slog.Default(), scheduler)
 	if err != nil {
