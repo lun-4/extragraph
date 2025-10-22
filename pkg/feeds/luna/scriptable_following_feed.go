@@ -454,65 +454,21 @@ func (ff *ScriptableFollowingFeed) handleFollow(userDid string, commit *models.C
 
 // handlePostFromJetstream processes a post event from Jetstream
 func (ff *ScriptableFollowingFeed) handlePostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
-	_ = ctx
-	// Skip delete/update operations - we only care about creates
-	if commit.Operation != "create" {
-		return
-	}
-
-	// Skip if record is empty
-	if len(commit.Record) == 0 {
-		slog.Debug("empty record for post", "did", userDid, "rkey", commit.RKey)
-		return
-	}
-
-	// Parse the record JSON
-	var rec map[string]interface{}
-	err := json.Unmarshal(commit.Record, &rec)
-	if err != nil {
-		slog.Debug("error unmarshaling post record", "err", err, "did", userDid, "rkey", commit.RKey)
-		return
-	}
-
-	ff.reportChannel <- INCOMING_POST
-
-	atPath := fmt.Sprintf("at://%s/app.bsky.feed.post/%s", userDid, commit.RKey)
-	ok, err := ff.handlePost(userDid, rec, atPath)
-	if err != nil {
-		slog.Error("error handling post", "path", atPath, "err", err)
-		return
-	}
-
-	ff.reportChannel <- PROCESSED_POST
-	if !ok {
-		return
-	}
-	ff.reportChannel <- ALLOWED_POST
-
-	// Get max counter and insert post
-	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
-	var maybeCurrentMaxIndex *uint64
-	err = row.Scan(&maybeCurrentMaxIndex)
-	if err != nil {
-		slog.Error("error getting max index", "err", err)
-		return
-	}
-
-	var newIndex uint64
-	if maybeCurrentMaxIndex != nil {
-		newIndex = *maybeCurrentMaxIndex + 1
-	}
-
-	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
-	if err != nil {
-		slog.Error("error inserting post", "err", err)
-	} else {
-		slog.Debug("post created", "at", atPath)
-	}
+	ff.handleRecordFromJetstream(ctx, userDid, commit, "post", ff.handlePost)
 }
 
-// handleRepostFromJetstream processes a repost event from Jetstream
 func (ff *ScriptableFollowingFeed) handleRepostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	ff.handleRecordFromJetstream(ctx, userDid, commit, "repost", ff.handleRepost)
+}
+
+// handleRecordFromJetstream is a generic handler for post/repost records from Jetstream
+func (ff *ScriptableFollowingFeed) handleRecordFromJetstream(
+	ctx context.Context,
+	userDid string,
+	commit *models.Commit,
+	recordType string,
+	handler func(string, map[string]any, string) (bool, error),
+) {
 	_ = ctx
 	// Skip delete/update operations - we only care about creates
 	if commit.Operation != "create" {
@@ -521,24 +477,24 @@ func (ff *ScriptableFollowingFeed) handleRepostFromJetstream(ctx context.Context
 
 	// Skip if record is empty
 	if len(commit.Record) == 0 {
-		slog.Debug("empty record for repost", "did", userDid, "rkey", commit.RKey)
+		slog.Debug("empty record", "type", recordType, "did", userDid, "rkey", commit.RKey)
 		return
 	}
 
 	// Parse the record JSON
-	var rec map[string]interface{}
+	var rec map[string]any
 	err := json.Unmarshal(commit.Record, &rec)
 	if err != nil {
-		slog.Debug("error unmarshaling repost record", "err", err, "did", userDid, "rkey", commit.RKey)
+		slog.Debug("error unmarshaling record", "type", recordType, "err", err, "did", userDid, "rkey", commit.RKey)
 		return
 	}
 
 	ff.reportChannel <- INCOMING_POST
 
-	atPath := fmt.Sprintf("at://%s/app.bsky.feed.repost/%s", userDid, commit.RKey)
-	ok, err := ff.handleRepost(userDid, rec, atPath)
+	atPath := fmt.Sprintf("at://%s/%s/%s", userDid, commit.Collection, commit.RKey)
+	ok, err := handler(userDid, rec, atPath)
 	if err != nil {
-		slog.Error("error handling repost", "path", atPath, "err", err)
+		slog.Error("error handling record", "type", recordType, "path", atPath, "err", err)
 		return
 	}
 
@@ -548,7 +504,7 @@ func (ff *ScriptableFollowingFeed) handleRepostFromJetstream(ctx context.Context
 	}
 	ff.reportChannel <- ALLOWED_POST
 
-	// Get max counter and insert repost
+	// Get max counter and insert record
 	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
 	var maybeCurrentMaxIndex *uint64
 	err = row.Scan(&maybeCurrentMaxIndex)
@@ -564,9 +520,9 @@ func (ff *ScriptableFollowingFeed) handleRepostFromJetstream(ctx context.Context
 
 	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
 	if err != nil {
-		slog.Error("error inserting repost", "err", err)
+		slog.Error("error inserting record", "type", recordType, "err", err)
 	} else {
-		slog.Debug("repost created", "at", atPath)
+		slog.Debug("record created", "type", recordType, "at", atPath)
 	}
 }
 

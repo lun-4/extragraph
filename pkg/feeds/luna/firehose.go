@@ -399,44 +399,15 @@ func (ff *FollowingFeed) handleFollow(userDid string, commit *models.Commit) {
 }
 
 func (ff *FollowingFeed) handlePostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
-	_ = ctx
-
-	// Skip delete/update operations - we only care about creates
-	// TODO care about post deletes someday lol
-	if commit.Operation != "create" {
-		return
-	}
-
-	// Skip if record is empty
-	if len(commit.Record) == 0 {
-		return
-	}
-
-	// Construct AT URI path from the RKey
-	atPath := fmt.Sprintf("at://%s/app.bsky.feed.post/%s", userDid, commit.RKey)
-
-	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
-	var maybeCurrentMaxIndex *uint64
-	err := row.Scan(&maybeCurrentMaxIndex)
-	if err != nil {
-		slog.Error("error getting max index", slog.Any("err", err))
-		return
-	}
-
-	var newIndex uint64
-	if maybeCurrentMaxIndex != nil {
-		newIndex = *maybeCurrentMaxIndex + 1
-	}
-
-	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
-	if err != nil {
-		slog.Error("error inserting post", slog.Any("err", err))
-	} else {
-		slog.Debug("post created", slog.String("at", atPath))
-	}
+	ff.handleRecordFromJetstream(ctx, userDid, commit, "post")
 }
 
 func (ff *FollowingFeed) handleRepostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	ff.handleRecordFromJetstream(ctx, userDid, commit, "repost")
+}
+
+// handleRecordFromJetstream is a generic handler for post/repost records from Jetstream
+func (ff *FollowingFeed) handleRecordFromJetstream(ctx context.Context, userDid string, commit *models.Commit, recordType string) {
 	_ = ctx
 
 	// Skip delete/update operations - we only care about creates
@@ -450,7 +421,7 @@ func (ff *FollowingFeed) handleRepostFromJetstream(ctx context.Context, userDid 
 	}
 
 	// Construct AT URI path from the RKey
-	atPath := fmt.Sprintf("at://%s/app.bsky.feed.repost/%s", userDid, commit.RKey)
+	atPath := fmt.Sprintf("at://%s/%s/%s", userDid, commit.Collection, commit.RKey)
 
 	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
 	var maybeCurrentMaxIndex *uint64
@@ -467,8 +438,8 @@ func (ff *FollowingFeed) handleRepostFromJetstream(ctx context.Context, userDid 
 
 	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
 	if err != nil {
-		slog.Error("error inserting repost", slog.Any("err", err))
+		slog.Error("error inserting record", "type", recordType, slog.Any("err", err))
 	} else {
-		slog.Debug("repost created", slog.String("at", atPath))
+		slog.Debug("record created", "type", recordType, slog.String("at", atPath))
 	}
 }
