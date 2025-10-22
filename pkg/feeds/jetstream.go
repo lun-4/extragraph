@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/bluesky-social/jetstream/pkg/client"
 	"github.com/bluesky-social/jetstream/pkg/client/schedulers/sequential"
@@ -13,8 +15,9 @@ import (
 
 // Broadcaster manages subscribers to Jetstream events
 type Broadcaster struct {
-	listeners []chan *models.Event
-	mu        sync.Mutex
+	listeners    []chan *models.Event
+	mu           sync.Mutex
+	lastActivity atomic.Int64 // Unix timestamp in nanoseconds
 }
 
 // Subscribe returns a new channel that will receive Jetstream events
@@ -30,6 +33,9 @@ func (b *Broadcaster) Subscribe() chan *models.Event {
 
 // Broadcast sends an event to all subscribers without blocking
 func (b *Broadcaster) Broadcast(event *models.Event) {
+	// Update last activity time (atomic, no lock needed)
+	b.lastActivity.Store(time.Now().UnixNano())
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -42,6 +48,15 @@ func (b *Broadcaster) Broadcast(event *models.Event) {
 			slog.Warn("jetstream broadcast: channel full, dropping event")
 		}
 	}
+}
+
+// GetLastActivity returns the time of the last event broadcast
+func (b *Broadcaster) GetLastActivity() time.Time {
+	nanos := b.lastActivity.Load()
+	if nanos == 0 {
+		return time.Time{} // Zero value
+	}
+	return time.Unix(0, nanos)
 }
 
 // JetstreamClient connects to Bluesky Jetstream and broadcasts events
@@ -89,13 +104,61 @@ func NewJetstreamClient() *JetstreamClient {
 }
 
 // Start begins consuming from the Jetstream and broadcasting events
-// It will automatically reconnect on errors via the underlying client
-func (jc *JetstreamClient) Start(ctx context.Context) error {
+// It will automatically reconnect on errors with exponential backoff
+func (jc *JetstreamClient) Start(ctx context.Context) {
 	slog.Info("starting jetstream client")
 
-	// Start with no cursor (from beginning)
-	// For production, you'd want to persist and restore this
-	return jc.client.ConnectAndRead(ctx, nil)
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("jetstream client shutting down")
+			return
+		default:
+			// Create a cancellable context for this connection attempt
+			connCtx, cancelConn := context.WithCancel(ctx)
+
+			// Start a watchdog goroutine to detect stuck connections
+			// If we don't receive ANY events for 60 seconds, the connection is dead
+			watchdogDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(1 * time.Second)
+				defer ticker.Stop()
+				defer close(watchdogDone)
+
+				for {
+					select {
+					case <-connCtx.Done():
+						return
+					case <-ticker.C:
+						lastActivity := jc.broadcaster.GetLastActivity()
+						if !lastActivity.IsZero() && time.Since(lastActivity) > 10*time.Second {
+							slog.Warn("jetstream watchdog: no events received in 10 seconds, reconnecting")
+							cancelConn()
+							return
+						}
+					}
+				}
+			}()
+
+			// Start with no cursor (from beginning)
+			// For production, you'd want to persist and restore this
+			err := jc.client.ConnectAndRead(connCtx, nil)
+			cancelConn()   // Cancel the watchdog
+			<-watchdogDone // Wait for watchdog to exit
+
+			if err != nil {
+				if ctx.Err() != nil {
+					// Main context cancelled, exit
+					slog.Info("jetstream client shutting down")
+					return
+				}
+				slog.Error("jetstream connection error", "err", err)
+			}
+
+			slog.Info("jetstream connection closed, reconnecting in 3 seconds")
+			time.Sleep(3 * time.Second)
+		}
+	}
 }
 
 // Subscribe returns a channel that receives Jetstream events

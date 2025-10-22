@@ -101,13 +101,7 @@ func main() {
 
 	// Start Jetstream client before feeds so it's available
 	jetstreamClient := feeds.NewJetstreamClient()
-	go func() {
-		slog.Info("starting jetstream client")
-		err := jetstreamClient.Start(ctx)
-		if err != nil {
-			slog.Error("jetstream client error", slog.Any("err", err))
-		}
-	}()
+	go jetstreamClient.Start(ctx)
 
 	lunaFeeds, _ := lunafeeds.ConfigureLunaFeeds(ctx, jetstreamClient)
 	for _, lunaFeed := range lunaFeeds {
