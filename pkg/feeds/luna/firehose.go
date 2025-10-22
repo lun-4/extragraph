@@ -1,7 +1,6 @@
 package luna
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,20 +9,14 @@ import (
 	"log"
 	"log/slog"
 	"math"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/bluesky-social/indigo/api/atproto"
 	appbsky "github.com/bluesky-social/indigo/api/bsky"
-	"github.com/bluesky-social/indigo/atproto/data"
-	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/events/schedulers/sequential"
-	"github.com/bluesky-social/indigo/repo"
+	"github.com/bluesky-social/jetstream/pkg/models"
 	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feedrouter"
-	"github.com/gorilla/websocket"
+	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds"
 	"github.com/samber/lo"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -35,11 +28,7 @@ type DynamicFeed interface {
 	GetFeedNames() []string
 }
 
-func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
-	relayAddress := os.Getenv("RELAY_WEBSOCKET_ADDRESS")
-	if relayAddress == "" {
-		panic("RELAY_WEBSOCKET_ADDRESS is required")
-	}
+func ConfigureLunaFeeds(ctx context.Context, jetstreamClient *feeds.JetstreamClient) ([]DynamicFeed, error) {
 	appviewUrl := os.Getenv("APPVIEW_URL")
 	if appviewUrl == "" {
 		panic("APPVIEW_URL is required")
@@ -50,7 +39,7 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 			FeedActorDID:     os.Getenv("FOLLOWING_FEED_ACTOR_DID"),
 			FeedName:         os.Getenv("FOLLOWING_FEED_NAME"),
 			DiscoverFeedName: os.Getenv("DISCOVER_FEED_NAME"),
-			relayAddress:     relayAddress,
+			jetstreamClient:  jetstreamClient,
 		})
 	} else {
 		slog.Warn("Following feed is disabled")
@@ -65,11 +54,11 @@ func ConfigureLunaFeeds(ctx context.Context) ([]DynamicFeed, error) {
 			FeedActorDID:           os.Getenv("SCRIPTABLE_FOLLOWING_FEED_ACTOR_DID"),
 			FeedName:               os.Getenv("SCRIPTABLE_FOLLOWING_FEED_NAME"),
 			DatabasePath:           databasePath,
-			relayAddress:           relayAddress,
 			appviewUrl:             os.Getenv("APPVIEW_URL"),
 			runtimes:               make(map[uint64]Runtime),
 			reportChannel:          make(chan int, 1000),
 			restartFirehoseChannel: make(chan bool, 1),
+			jetstreamClient:        jetstreamClient,
 		})
 	} else {
 		slog.Warn("scriptable following feed is disabled, skipping")
@@ -86,8 +75,8 @@ type FollowingFeed struct {
 	FeedName         string
 	DiscoverFeedName string
 	db               *sql.DB
-	relayAddress     string
 	appviewUrl       string
+	jetstreamClient  *feeds.JetstreamClient
 }
 
 func (ff *FollowingFeed) Describe(ctx context.Context) ([]appbsky.FeedDescribeFeedGenerator_Feed, error) {
@@ -329,96 +318,121 @@ func (ff *FollowingFeed) Spawn(ctx context.Context) {
 
 func (ff *FollowingFeed) main(ctx context.Context) {
 	defer ff.db.Close()
+
+	if ff.jetstreamClient == nil {
+		slog.Error("jetstream client is nil, cannot start following feed")
+		return
+	}
+
+	eventsChan := ff.jetstreamClient.Subscribe()
+	slog.Info("following feed subscribed to jetstream")
+
 	for {
-		err := ff.firehoseConsumer(ctx)
-		if err != nil {
-			slog.Error("error in firehose consumer", slog.Any("err", err))
+		select {
+		case <-ctx.Done():
+			slog.Info("following feed shutting down")
+			return
+		case evt := <-eventsChan:
+			if evt == nil {
+				continue
+			}
+			ff.handleJetstreamEvent(ctx, evt)
 		}
-		slog.Info("firehose consumer stopped, restarting in 3 seconds")
-		time.Sleep(3 * time.Second)
 	}
 }
 
-func (ff *FollowingFeed) firehoseConsumer(ctx context.Context) error {
-	// TODO store max cursor from firehose for the events we successfully processed and then inject it here
-	uri := fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=0", ff.relayAddress)
-	con, _, err := websocket.DefaultDialer.Dial(uri, http.Header{})
+func (ff *FollowingFeed) handleJetstreamEvent(ctx context.Context, evt *models.Event) {
+	if evt.Kind != "commit" || evt.Commit == nil {
+		return
+	}
+
+	commit := evt.Commit
+	userDid := evt.Did
+
+	switch commit.Collection {
+	case "app.bsky.graph.follow":
+		ff.handleFollow(userDid, commit)
+	case "app.bsky.feed.post":
+		ff.handlePostFromJetstream(ctx, userDid, commit)
+	case "app.bsky.feed.repost":
+		ff.handleRepostFromJetstream(ctx, userDid, commit)
+	}
+}
+
+func (ff *FollowingFeed) handleFollow(userDid string, commit *models.Commit) {
+	// Skip delete/update operations - we only care about creates
+	// TODO: care about follow deletes lol
+	if commit.Operation != "create" {
+		return
+	}
+
+	// Skip if record is empty
+	if len(commit.Record) == 0 {
+		return
+	}
+
+	var rec map[string]any
+	err := json.Unmarshal(commit.Record, &rec)
 	if err != nil {
-		return err
-	}
-	defer con.Close()
-	rsc := &events.RepoStreamCallbacks{
-		RepoCommit: func(evt *atproto.SyncSubscribeRepos_Commit) error {
-			rr, err := repo.ReadRepoFromCar(ctx, bytes.NewReader(evt.Blocks))
-			if err != nil {
-				return nil
-			}
-			userDid := evt.Repo
-			for _, op := range evt.Ops {
-				slog.Debug("incoming event", slog.String("path", op.Path), slog.Any("cid", op.Cid), slog.String("action", op.Action), slog.String("repo", evt.Repo))
-				rcid, recBytes, err := rr.GetRecordBytes(ctx, op.Path)
-				if err != nil {
-					return nil
-				}
-				slog.Debug("event", slog.String("rcid", rcid.String()))
-
-				recordType, recordData, err := data.ExtractTypeCBORReader(bytes.NewReader(*recBytes))
-				if err != nil {
-					return nil
-				}
-				slog.Debug("record", slog.String("record", recordType))
-
-				switch recordType {
-				case "app.bsky.graph.follow":
-					rec, err := data.UnmarshalCBOR(recordData)
-					if err != nil {
-						return nil
-					}
-
-					recJSON, err := json.Marshal(rec)
-					if err != nil {
-						return nil
-					}
-
-					subject, ok := rec["subject"].(string)
-					slog.Debug("follow", slog.String("text", string(recJSON)))
-					if ok {
-						_, err := ff.db.Exec(`INSERT INTO follow_relationships (from_did, to_did) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userDid, subject)
-						if err != nil {
-							slog.Error("error inserting following", slog.Any("err", err))
-						} else {
-							slog.Debug("followed", slog.String("from", userDid), slog.String("to", subject))
-						}
-					}
-				case "app.bsky.feed.post":
-					atPath := fmt.Sprintf("at://%s/%s", userDid, op.Path)
-					row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
-					var maybeCurrentMaxIndex *uint64
-					err := row.Scan(&maybeCurrentMaxIndex)
-					if err != nil {
-						slog.Error("error getting max index", slog.Any("err", err))
-						return nil
-					}
-
-					var newIndex uint64
-					if maybeCurrentMaxIndex != nil {
-						newIndex = *maybeCurrentMaxIndex + 1
-					}
-					_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
-					if err != nil {
-						slog.Error("error inserting post", slog.Any("err", err))
-					} else {
-						slog.Debug("post created", slog.String("at", atPath))
-					}
-				default:
-					slog.Debug("unknown record type, ignoring", slog.String("record", recordType))
-				}
-			}
-
-			return nil
-		},
+		slog.Debug("error unmarshaling follow record", slog.Any("err", err))
+		return
 	}
 
-	sched := sequential.NewScheduler("following_feed", rsc.EventHandler)
-	return events.HandleRepoStream(ctx, con, sched)
+	subject, ok := rec["subject"].(string)
+	if !ok {
+		return
+	}
+
+	_, err = ff.db.Exec(`INSERT INTO follow_relationships (from_did, to_did) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userDid, subject)
+	if err != nil {
+		slog.Error("error inserting following", slog.Any("err", err))
+	} else {
+		slog.Debug("followed", slog.String("from", userDid), slog.String("to", subject))
+	}
+}
+
+func (ff *FollowingFeed) handlePostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	ff.handleRecordFromJetstream(ctx, userDid, commit, "post")
+}
+
+func (ff *FollowingFeed) handleRepostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	ff.handleRecordFromJetstream(ctx, userDid, commit, "repost")
+}
+
+// handleRecordFromJetstream is a generic handler for post/repost records from Jetstream
+func (ff *FollowingFeed) handleRecordFromJetstream(ctx context.Context, userDid string, commit *models.Commit, recordType string) {
+	_ = ctx
+
+	// Skip delete/update operations - we only care about creates
+	if commit.Operation != "create" {
+		return
+	}
+
+	// Skip if record is empty
+	if len(commit.Record) == 0 {
+		return
+	}
+
+	// Construct AT URI path from the RKey
+	atPath := fmt.Sprintf("at://%s/%s/%s", userDid, commit.Collection, commit.RKey)
+
+	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
+	var maybeCurrentMaxIndex *uint64
+	err := row.Scan(&maybeCurrentMaxIndex)
+	if err != nil {
+		slog.Error("error getting max index", slog.Any("err", err))
+		return
+	}
+
+	var newIndex uint64
+	if maybeCurrentMaxIndex != nil {
+		newIndex = *maybeCurrentMaxIndex + 1
+	}
+
+	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
+	if err != nil {
+		slog.Error("error inserting record", "type", recordType, slog.Any("err", err))
+	} else {
+		slog.Debug("record created", "type", recordType, slog.String("at", atPath))
+	}
 }

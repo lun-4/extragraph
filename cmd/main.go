@@ -15,6 +15,7 @@ import (
 	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feedrouter"
 	ginendpoints "github.com/ericvolp12/go-bsky-feed-generator/pkg/gin"
 
+	"github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds"
 	lunafeeds "github.com/ericvolp12/go-bsky-feed-generator/pkg/feeds/luna"
 	ginprometheus "github.com/ericvolp12/go-gin-prometheus"
 	"github.com/gin-gonic/gin"
@@ -98,7 +99,11 @@ func main() {
 	// Feeds conform to the Feed interface, which is defined in
 	// pkg/feedrouter/feedrouter.go
 
-	lunaFeeds, _ := lunafeeds.ConfigureLunaFeeds(ctx)
+	// Start Jetstream client before feeds so it's available
+	jetstreamClient := feeds.NewJetstreamClient()
+	go jetstreamClient.Start(ctx)
+
+	lunaFeeds, _ := lunafeeds.ConfigureLunaFeeds(ctx, jetstreamClient)
 	for _, lunaFeed := range lunaFeeds {
 		lunaFeed.Spawn(ctx)
 		feedRouter.AddFeed(lunaFeed.GetFeedNames(), lunaFeed)
