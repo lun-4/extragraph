@@ -114,11 +114,16 @@ func (jc *JetstreamClient) Start(ctx context.Context) {
 			slog.Info("jetstream client shutting down")
 			return
 		default:
+			// Reset lastActivity before each connection attempt to give the new connection
+			// a grace period. Otherwise, we'd immediately kill new connections based on
+			// stale timestamps from the previous connection.
+			jc.broadcaster.lastActivity.Store(0)
+
 			// Create a cancellable context for this connection attempt
 			connCtx, cancelConn := context.WithCancel(ctx)
 
 			// Start a watchdog goroutine to detect stuck connections
-			// If we don't receive ANY events for 60 seconds, the connection is dead
+			// If we don't receive ANY events for 10 seconds, the connection is dead
 			watchdogDone := make(chan struct{})
 			go func() {
 				ticker := time.NewTicker(1 * time.Second)
