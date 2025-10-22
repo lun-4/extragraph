@@ -50,7 +50,7 @@ export SCRIPTABLE_FOLLOWING_FEED_NAME=scriptable
 export SERVICE_ENDPOINT=https://feedgen.bsky.ln4.net
 
 # using the main bluesky llc appview and relay:
-export RELAY_WEBSOCKET_ADDRESS=wss://bsky.network
+export JETSTREAM_WEBSOCKET_ADDRESS=wss://jetstream.fire.hose.cam
 export APPVIEW_URL=https://public.api.bsky.app
 
 make build
