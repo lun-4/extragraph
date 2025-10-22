@@ -29,10 +29,6 @@ type DynamicFeed interface {
 }
 
 func ConfigureLunaFeeds(ctx context.Context, jetstreamClient *feeds.JetstreamClient) ([]DynamicFeed, error) {
-	jetstreamAddress := os.Getenv("JETSTREAM_WEBSOCKET_ADDRESS")
-	if jetstreamAddress == "" {
-		panic("JETSTREAM_WEBSOCKET_ADDRESS is required")
-	}
 	appviewUrl := os.Getenv("APPVIEW_URL")
 	if appviewUrl == "" {
 		panic("APPVIEW_URL is required")
