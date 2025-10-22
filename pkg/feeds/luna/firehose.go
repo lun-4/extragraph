@@ -361,6 +361,8 @@ func (ff *FollowingFeed) handleJetstreamEvent(ctx context.Context, evt *models.E
 		ff.handleFollow(userDid, commit)
 	case "app.bsky.feed.post":
 		ff.handlePostFromJetstream(ctx, userDid, commit)
+	case "app.bsky.feed.repost":
+		ff.handleRepostFromJetstream(ctx, userDid, commit)
 	}
 }
 
@@ -431,5 +433,42 @@ func (ff *FollowingFeed) handlePostFromJetstream(ctx context.Context, userDid st
 		slog.Error("error inserting post", slog.Any("err", err))
 	} else {
 		slog.Debug("post created", slog.String("at", atPath))
+	}
+}
+
+func (ff *FollowingFeed) handleRepostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	_ = ctx
+
+	// Skip delete/update operations - we only care about creates
+	if commit.Operation != "create" {
+		return
+	}
+
+	// Skip if record is empty
+	if len(commit.Record) == 0 {
+		return
+	}
+
+	// Construct AT URI path from the RKey
+	atPath := fmt.Sprintf("at://%s/app.bsky.feed.repost/%s", userDid, commit.RKey)
+
+	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
+	var maybeCurrentMaxIndex *uint64
+	err := row.Scan(&maybeCurrentMaxIndex)
+	if err != nil {
+		slog.Error("error getting max index", slog.Any("err", err))
+		return
+	}
+
+	var newIndex uint64
+	if maybeCurrentMaxIndex != nil {
+		newIndex = *maybeCurrentMaxIndex + 1
+	}
+
+	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
+	if err != nil {
+		slog.Error("error inserting repost", slog.Any("err", err))
+	} else {
+		slog.Debug("repost created", slog.String("at", atPath))
 	}
 }

@@ -219,29 +219,6 @@ func (ff *ScriptableFollowingFeed) GetFeedNames() []string {
 	return feeds
 }
 
-func (ff *ScriptableFollowingFeed) getFollowing(userDID string) ([]string, error) {
-	rows, err := ff.db.Query(`
-		SELECT to_did
-		FROM follow_relationships
-		WHERE from_did = ?`,
-		userDID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	dids := make([]string, 0)
-	for rows.Next() {
-		var did string
-		err := rows.Scan(&did)
-		if err != nil {
-			return nil, err
-		}
-		dids = append(dids, did)
-	}
-	return dids, nil
-}
-
 func (ff *ScriptableFollowingFeed) GetPage(ctx context.Context, feed string, userDID string, limit int64, cursor string) ([]*appbsky.FeedDefs_SkeletonFeedPost, *string, error) {
 	slog.Info("following feed page", slog.String("feed", feed), slog.String("user", userDID), slog.Int64("limit", limit), slog.String("cursor", cursor))
 
@@ -422,6 +399,8 @@ func (ff *ScriptableFollowingFeed) handleJetstreamEvent(ctx context.Context, evt
 		ff.handleFollow(userDid, commit)
 	case "app.bsky.feed.post":
 		ff.handlePostFromJetstream(ctx, userDid, commit)
+	case "app.bsky.feed.repost":
+		ff.handleRepostFromJetstream(ctx, userDid, commit)
 	default:
 		slog.Debug("unhandled collection", "collection", commit.Collection)
 	}
@@ -475,6 +454,7 @@ func (ff *ScriptableFollowingFeed) handleFollow(userDid string, commit *models.C
 
 // handlePostFromJetstream processes a post event from Jetstream
 func (ff *ScriptableFollowingFeed) handlePostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	_ = ctx
 	// Skip delete/update operations - we only care about creates
 	if commit.Operation != "create" {
 		return
@@ -528,6 +508,65 @@ func (ff *ScriptableFollowingFeed) handlePostFromJetstream(ctx context.Context, 
 		slog.Error("error inserting post", "err", err)
 	} else {
 		slog.Debug("post created", "at", atPath)
+	}
+}
+
+// handleRepostFromJetstream processes a repost event from Jetstream
+func (ff *ScriptableFollowingFeed) handleRepostFromJetstream(ctx context.Context, userDid string, commit *models.Commit) {
+	_ = ctx
+	// Skip delete/update operations - we only care about creates
+	if commit.Operation != "create" {
+		return
+	}
+
+	// Skip if record is empty
+	if len(commit.Record) == 0 {
+		slog.Debug("empty record for repost", "did", userDid, "rkey", commit.RKey)
+		return
+	}
+
+	// Parse the record JSON
+	var rec map[string]interface{}
+	err := json.Unmarshal(commit.Record, &rec)
+	if err != nil {
+		slog.Debug("error unmarshaling repost record", "err", err, "did", userDid, "rkey", commit.RKey)
+		return
+	}
+
+	ff.reportChannel <- INCOMING_POST
+
+	atPath := fmt.Sprintf("at://%s/app.bsky.feed.repost/%s", userDid, commit.RKey)
+	ok, err := ff.handleRepost(userDid, rec, atPath)
+	if err != nil {
+		slog.Error("error handling repost", "path", atPath, "err", err)
+		return
+	}
+
+	ff.reportChannel <- PROCESSED_POST
+	if !ok {
+		return
+	}
+	ff.reportChannel <- ALLOWED_POST
+
+	// Get max counter and insert repost
+	row := ff.db.QueryRow(`SELECT MAX(counter) FROM posts`)
+	var maybeCurrentMaxIndex *uint64
+	err = row.Scan(&maybeCurrentMaxIndex)
+	if err != nil {
+		slog.Error("error getting max index", "err", err)
+		return
+	}
+
+	var newIndex uint64
+	if maybeCurrentMaxIndex != nil {
+		newIndex = *maybeCurrentMaxIndex + 1
+	}
+
+	_, err = ff.db.Exec(`INSERT INTO posts (author_did, at_path, counter) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userDid, atPath, newIndex)
+	if err != nil {
+		slog.Error("error inserting repost", "err", err)
+	} else {
+		slog.Debug("repost created", "at", atPath)
 	}
 }
 
@@ -729,6 +768,7 @@ func (ff *ScriptableFollowingFeed) executeWasmFilter(
 	followsMap map[string]int,
 	followedMap map[string]int,
 ) (bool, error) {
+	_ = ctx
 	slog.Debug("executeWasmFilter START")
 
 	// Build context map for JSON serialization
